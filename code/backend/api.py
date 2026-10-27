@@ -13,16 +13,21 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from backend.compiler import validate
+from backend.demo_orders import start_demo_orders
 from backend.executors.models import model_mode
+from backend.model_settings import ModelSettingsRequest, list_models, test_connection
 from backend.registry import FUNCTIONS, NODE_TYPES, skills
 from backend.repository import Repository, digest, dump, now, uid
+from backend.resources import register_resources
 from backend.runtime import TERMINAL, Runtime
 from backend.schemas import BusinessError, CreateAgent, DraftRequest, RunRequest, Workflow
 from backend.seeds import manifest, seed
+from backend.v2 import seed_v2, semantic_digest
+from backend.workflow_management import active_agent, blank_workflow, register_management
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 logging.basicConfig(level=logging.INFO)
@@ -32,14 +37,21 @@ def create_app(data_dir=None):
     repo = Repository(data_dir)
     seed(repo)
     runtime = Runtime(repo)
+    seed_v2(repo, runtime.resources)
 
     @asynccontextmanager
     async def lifespan(app):
+        import os
+
+        order_service = start_demo_orders(os.getenv("WORKFLOW_DEMO_ORDERS_URL", "http://127.0.0.1:18765"))
         task = asyncio.create_task(runtime.worker())
         yield
         runtime.stopping = True
         await task
         await asyncio.to_thread(runtime.pool.shutdown, wait=True)
+        if order_service:
+            await asyncio.to_thread(order_service.shutdown)
+            order_service.server_close()
         repo.close()
 
     app = FastAPI(title="Workflow Studio", version="0.1.0", lifespan=lifespan)
@@ -53,7 +65,7 @@ def create_app(data_dir=None):
             "http://127.0.0.1:8000",
             "http://localhost:8000",
         ],
-        allow_methods=["GET", "POST", "PUT"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         allow_headers=["Content-Type", "Last-Event-ID"],
         allow_origin_regex=r"http://(?:127\.0\.0\.1|localhost):\d{1,5}",
     )
@@ -99,18 +111,20 @@ def create_app(data_dir=None):
         return value
 
     def all_errors(wf, root_id=None, chain=None):
-        errors = validate(wf)
+        errors = validate(wf, runtime.resources)
         chain = (chain or []) + ([root_id] if root_id else [])
         for child in wf.child_agent_refs:
             key = f"{child['agent_id']}:{child['version']}"
             release = repo.get("release", key)
             if child["agent_id"] in chain or len(chain) >= 3:
                 errors.append({"node_id": None, "message": "子 Agent 递归或调用深度超限"})
-            elif not release or release.get("revoked"):
+            elif (
+                not release or release.get("revoked") or (repo.get("agent", child["agent_id"]) or {}).get("deleted_at")
+            ):
                 errors.append({"node_id": None, "message": "子 Agent 发布版本不存在或已撤销"})
             else:
                 child_wf = Workflow.model_validate(release["workflow"])
-                if any(n.type == "approval" for n in child_wf.nodes):
+                if any(n.type in ("approval", "human_input") for n in child_wf.nodes):
                     errors.append({"node_id": None, "message": "当前 Demo 固定子调用仅支持无需审批的流程"})
                 errors.extend(all_errors(child_wf, child["agent_id"], chain))
         return errors
@@ -121,20 +135,60 @@ def create_app(data_dir=None):
             "service": "workflow-studio",
             "status": "ok",
             "engine": "LangGraph",
-            "model_mode": model_mode(),
+            "model_mode": model_mode(runtime.model_settings.current()),
             "identity": "local-demo-operator",
             "storage": "SQLite + SqliteSaver",
             "dependencies": manifest({"nodes": [], "skill_refs": []})["packages"],
         }
 
+    @app.get("/api/settings/model")
+    def model_settings():
+        return runtime.model_settings.public()
+
+    @app.put("/api/settings/model")
+    def save_model_settings(body: ModelSettingsRequest):
+        result = runtime.model_settings.save(body)
+        runtime.resources.refresh_default()
+        return result
+
+    @app.post("/api/settings/model/test")
+    def test_model_settings(body: ModelSettingsRequest):
+        return test_connection(runtime.model_settings.candidate(body))
+
+    @app.post("/api/settings/model/models")
+    def available_models(body: ModelSettingsRequest):
+        return list_models(runtime.model_settings.candidate(body))
+
     @app.get("/api/node-types")
     def node_types():
+        from backend.v2 import CONFIG_MODELS
+
         return {
-            "nodes": NODE_TYPES,
+            "nodes": NODE_TYPES
+            + [
+                {
+                    "type": "http",
+                    "label": "HTTP 查询",
+                    "description": "调用已登记的只读 HTTP 操作",
+                    "type_version": "1",
+                    "schema_versions": ["2.0"],
+                },
+                {
+                    "type": "human_input",
+                    "label": "人工确认",
+                    "description": "确认摘要或拒绝取消运行",
+                    "type_version": "1",
+                    "schema_versions": ["2.0"],
+                },
+            ],
             "functions": FUNCTIONS,
             "skills": skills(),
             "schemas": {"input": {"project_id": "PRJ-1001", "progress": 80, "task": "分析交付风险"}},
             "policy_limits": {"max_model_calls": 6, "max_tool_calls": 6, "max_depth": 2, "concurrency": 3},
+            "v2_descriptors": [
+                {"type": kind, "type_version": "1", "config_schema": model.model_json_schema(), "schema_version": "2.0"}
+                for kind, model in CONFIG_MODELS.items()
+            ],
         }
 
     @app.get("/api/projects")
@@ -142,8 +196,8 @@ def create_app(data_dir=None):
         return repo.list("project")
 
     @app.get("/api/agents")
-    def agents():
-        return list(reversed(repo.list("agent")))
+    def agents(deleted: bool = False):
+        return [a for a in reversed(repo.list("agent")) if bool(a.get("deleted_at")) == deleted]
 
     @app.post("/api/agents", status_code=201)
     def create_agent(body: CreateAgent):
@@ -159,8 +213,24 @@ def create_app(data_dir=None):
             "latest_version": None,
             "created_at": now(),
             "updated_at": now(),
+            "deleted_at": None,
         }
+        value["workflow"]["workflow_id"] = agent_id.replace("_", "-")
         return repo.put("agent", agent_id, value)
+
+    class BlankRequest(BaseModel):
+        name: str
+        schema_version: Literal["1.0", "2.0"] = "1.0"
+
+    @app.post("/api/agents/blank", status_code=201)
+    def create_blank(body: BlankRequest):
+        return create_agent(
+            CreateAgent(
+                name=body.name.strip(),
+                workflow=blank_workflow(body.schema_version),
+                layout={"n_input": {"x": 80, "y": 160}, "n_output": {"x": 600, "y": 160}},
+            )
+        )
 
     @app.get("/api/agents/{agent_id}")
     def agent_detail(agent_id: str):
@@ -169,7 +239,7 @@ def create_app(data_dir=None):
     @app.put("/api/agents/{agent_id}/draft")
     def save_draft(agent_id: str, body: DraftRequest):
         with repo.lock:
-            agent = get("agent", agent_id)
+            agent = active_agent(repo, agent_id)
             if body.revision != agent["revision"]:
                 raise BusinessError("REVISION_CONFLICT", "草稿版本已变化，请重新载入后编辑")
             return repo.update(
@@ -185,19 +255,24 @@ def create_app(data_dir=None):
 
     @app.post("/api/agents/{agent_id}/validate")
     def validate_agent(agent_id: str):
-        agent = get("agent", agent_id)
+        agent = active_agent(repo, agent_id)
         errors = all_errors(Workflow.model_validate(agent["workflow"]), agent_id)
         return {"valid": not errors, "errors": errors, "revision": agent["revision"]}
 
     @app.post("/api/agents/{agent_id}/simulate")
     def simulate(agent_id: str):
         with repo.lock:
-            agent = get("agent", agent_id)
+            agent = active_agent(repo, agent_id)
             errors = all_errors(Workflow.model_validate(agent["workflow"]), agent_id)
             if errors:
                 return {"valid": False, "errors": errors}
             # Static dry run: no model or software adapter is invoked.
-            repo.update("agent", agent_id, simulated_digest=digest(agent["workflow"]))
+            v2 = agent["workflow"].get("schema_version") == "2.0"
+            repo.update(
+                "agent",
+                agent_id,
+                simulated_digest=semantic_digest(agent["workflow"]) if v2 else digest(agent["workflow"]),
+            )
             return {
                 "valid": True,
                 "errors": [],
@@ -209,7 +284,7 @@ def create_app(data_dir=None):
                     if FUNCTIONS.get(n["config"].get("function_ref"), {}).get("effect")
                     in ("idempotent_write", "non_idempotent_write")
                 ],
-                "tools": agent["workflow"]["policy"]["tools"],
+                "tools": agent["workflow"]["policy"].get("capability_refs" if v2 else "tools", []),
                 "dependency_manifest": manifest(agent["workflow"]),
             }
 
@@ -220,13 +295,15 @@ def create_app(data_dir=None):
     @app.post("/api/agents/{agent_id}/publish")
     def publish(agent_id: str, body: PublishRequest):
         with repo.transaction():
-            agent = get("agent", agent_id)
+            agent = active_agent(repo, agent_id)
             if body.revision != agent["revision"] or not body.confirmed:
                 raise BusinessError("REVISION_CONFLICT", "发布必须确认当前草稿版本")
             errors = all_errors(Workflow.model_validate(agent["workflow"]), agent_id)
             if errors:
                 raise BusinessError("DSL_INVALID", "; ".join(e["message"] for e in errors))
-            if agent.get("simulated_digest") != digest(agent["workflow"]):
+            v2 = agent["workflow"].get("schema_version") == "2.0"
+            current_digest = semantic_digest(agent["workflow"]) if v2 else digest(agent["workflow"])
+            if agent.get("simulated_digest") != current_digest:
                 raise BusinessError("SIMULATION_REQUIRED", "请先完成当前版本的无副作用预检")
             releases = [r for r in repo.list("release") if r["agent_id"] == agent_id]
             version = f"1.0.{len(releases)}"
@@ -236,11 +313,14 @@ def create_app(data_dir=None):
                 "version": version,
                 "workflow": agent["workflow"],
                 "layout": agent["layout"],
-                "sha256": digest(agent["workflow"]),
+                "sha256": current_digest,
                 "dependency_manifest": manifest(agent["workflow"]),
                 "created_at": now(),
                 "revoked": False,
             }
+            if v2:
+                value["resolved_bindings"] = runtime.resources.bindings(Workflow.model_validate(agent["workflow"]))
+                value["dependency_manifest"]["resources"] = value["resolved_bindings"]
             repo.put("release", f"{agent_id}:{version}", value)
             repo.update("agent", agent_id, latest_version=version)
             return value
@@ -295,7 +375,7 @@ def create_app(data_dir=None):
             ),
             "evaluation": summarize([r.get("duration_ms") for r in repo.list("evaluation")]),
             "environment": "local-demo",
-            "model_mode": model_mode(),
+            "model_mode": model_mode(runtime.model_settings.current()),
         }
 
     @app.get("/api/runs")
@@ -309,6 +389,7 @@ def create_app(data_dir=None):
     def run_detail(run_id: str):
         run = get("run", run_id)
         run["approvals"] = [a for a in repo.list("approval") if a["run_id"] == run_id]
+        run["input_requests"] = [r for r in repo.list("human_input") if r["run_id"] == run_id]
         run["operations"] = [o for o in repo.list("operation") if o["run_id"] == run_id]
         run["children"] = [
             {"id": r["id"], "status": r["status"], "agent_name": r["agent_name"]}
@@ -386,10 +467,61 @@ def create_app(data_dir=None):
                 return run
             value = repo.update("run", run_id, cancel_requested=True)
             repo.event(run_id, "run.cancel_requested")
-            if run["status"] in ("AWAITING_APPROVAL", "QUEUED"):
+            if run["status"] in ("AWAITING_APPROVAL", "AWAITING_INPUT", "QUEUED"):
                 runtime.finish(run_id, "CANCELLED")
                 value = get("run", run_id)
             return value
+
+    class InputDecision(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        revision: int = Field(ge=1)
+        decision: Literal["accept", "reject"]
+        payload: dict = Field(default_factory=dict)
+        idempotency_key: str = Field(min_length=8, max_length=128)
+
+    @app.post("/api/runs/{run_id}/inputs/{request_id}")
+    def submit_input(run_id: str, request_id: str, body: InputDecision):
+        from backend.schema_validation import validate_data
+
+        with repo.transaction():
+            run = get("run", run_id)
+            record = get("human_input", request_id)
+            if record["run_id"] != run_id:
+                raise BusinessError("POLICY_DENIED", "人工确认不属于此运行")
+            request_hash = digest(body.model_dump(exclude={"idempotency_key"}))
+            if record.get("idempotency_key") == body.idempotency_key:
+                if record.get("request_hash") != request_hash:
+                    raise BusinessError("IDEMPOTENCY_CONFLICT", "同一幂等键不能提交不同反馈")
+                return record
+            if (
+                record["revision"] != body.revision
+                or record["status"] != "PENDING"
+                or run["status"] != "AWAITING_INPUT"
+            ):
+                raise BusinessError("REVISION_CONFLICT", "人工确认已处理或运行未等待输入")
+            if record["expires_at"] < time.time():
+                raise BusinessError("INPUT_EXPIRED", "人工确认已过期")
+            if body.decision == "accept":
+                validate_data(record["form_schema"], body.payload)
+            record = repo.update(
+                "human_input",
+                request_id,
+                status="ACCEPTED" if body.decision == "accept" else "REJECTED",
+                payload=body.payload,
+                revision=record["revision"] + 1,
+                actor_ref="local-demo-operator",
+                decided_at=now(),
+                idempotency_key=body.idempotency_key,
+                request_hash=request_hash,
+            )
+            repo.event(
+                run_id,
+                "input.resolved",
+                record["node_id"],
+                {"request_id": request_id, "decision": body.decision, "payload": body.payload},
+            )
+            repo.update("run", run_id, status="QUEUED", resume={"request_id": request_id})
+            return record
 
     @app.post("/api/runs/{run_id}/reconcile")
     def reconcile(run_id: str):
@@ -440,11 +572,19 @@ def create_app(data_dir=None):
     @app.get("/api/runs/{run_id}/evidence")
     def evidence_index(run_id: str):
         get("run", run_id)
-        return [e for e in repo.list("evidence") if e["run_id"] == run_id]
+        return repo.evidence_index(run_id)
 
     @app.get("/api/evidence/{evidence_id}")
     def evidence(evidence_id: str):
-        return get("evidence", evidence_id)
+        value = get("evidence", evidence_id)
+        index = next(e for e in repo.evidence_index(value["run_id"]) if e["id"] == evidence_id)
+        return {**value, "title": index["title"]}
+
+    register_management(app, repo)
+    register_resources(app, runtime.resources)
+    from backend.workflow_assistant import register_assistant
+
+    register_assistant(app, repo, runtime.model_settings, all_errors, runtime.resources)
 
     frontend = Path(__file__).resolve().parent.parent / "frontend" / "dist"
     if frontend.exists():

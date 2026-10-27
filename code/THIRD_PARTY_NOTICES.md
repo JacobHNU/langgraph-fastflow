@@ -13,6 +13,11 @@ recorded in `uv.lock` and `frontend/package-lock.json`.
 | FastAPI | https://github.com/fastapi/fastapi | MIT | HTTP API and SSE |
 | React | https://github.com/facebook/react | MIT | Frontend rendering |
 | Lucide | https://github.com/lucide-icons/lucide | ISC | UI icons |
+| React JSON Schema Form | https://github.com/rjsf-team/react-jsonschema-form | Apache-2.0 | Dynamic run and human feedback forms |
+| Ajv | https://github.com/ajv-validator/ajv | MIT | Frontend JSON Schema validation |
+| python-jsonschema | https://github.com/python-jsonschema/jsonschema | MIT | Server-side JSON Schema validation |
+| Jinja | https://github.com/pallets/jinja | BSD-3-Clause | Restricted prompt interpolation |
+| rfc8785 | https://github.com/trailofbits/rfc8785.py | Apache-2.0 | Canonical semantic digests |
 
 FlowGram reference source was fetched with a sparse Git checkout to
 `vendor/flowgram-reference`, commit

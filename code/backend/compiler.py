@@ -26,7 +26,7 @@ def references(value: Any):
             yield from references(child)
 
 
-def validate(workflow: Workflow) -> list[dict]:
+def validate(workflow: Workflow, resources=None) -> list[dict]:
     errors = []
 
     def error(message, node_id=None):
@@ -73,6 +73,15 @@ def validate(workflow: Workflow) -> list[dict]:
         error("存在不可达节点")
     if incoming[workflow.entry_node]:
         error("入口不能有入边")
+    v2 = workflow.schema_version == "2.0"
+    if v2:
+        from backend.v2 import validate_v2
+
+        validate_v2(workflow, resources, error)
+        if errors:
+            return errors
+    elif any(n.type in ("http", "human_input") for n in nodes.values()):
+        error("HTTP 和人工反馈节点需要 V2 流程")
     allowed_tools = workflow.policy.get("tools", [])
     if not isinstance(allowed_tools, list) or any(t not in FUNCTIONS for t in allowed_tools):
         error("策略包含未注册工具")
@@ -104,6 +113,11 @@ def validate(workflow: Workflow) -> list[dict]:
                 error("输入引用必须指向当前路径必经的上游节点", key)
             if not isinstance(ref.get("path", []), list):
                 error("引用 path 必须是数组", key)
+        if v2:
+            from backend.v2 import validate_references
+
+            if all(isinstance(ref.get("path", []), list) for ref in references(node.inputs)):
+                validate_references(workflow, node, error, resources)
         if node.type in ("python", "python_workflow"):
             fn = node.config.get("function_ref")
             if fn not in FUNCTIONS:
@@ -130,7 +144,7 @@ def validate(workflow: Workflow) -> list[dict]:
                         pending.extend(e.target for e in outgoing[target])
                     if not verify_after:
                         error("写操作后缺少核验", key)
-        if node.type in ("agent", "llm"):
+        if node.type in ("agent", "llm") and not v2:
             if node.config.get("executor", "langchain_agent") not in ("direct_model", "langchain_agent", "deep_agent"):
                 error("未知模型执行器", key)
             requested = node.config.get("tools", ["project.query_status@1"])
@@ -173,8 +187,8 @@ def resolve(value: Any, state: WorkflowState) -> Any:
     return value
 
 
-def compile_workflow(workflow: Workflow, executor, checkpointer):
-    errors = validate(workflow)
+def compile_workflow(workflow: Workflow, executor, checkpointer, resources=None):
+    errors = validate(workflow, resources)
     if errors:
         raise BusinessError("DSL_INVALID", "; ".join(e["message"] for e in errors))
     graph = StateGraph(WorkflowState)

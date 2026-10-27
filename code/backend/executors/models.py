@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 
+from backend.model_settings import ModelConfig, require_model_key
 from backend.repository import dump, uid
 from backend.schemas import Assessment, BusinessError
 
@@ -27,6 +28,17 @@ class DemoChatModel(BaseChatModel):
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
         last_human = next((str(m.content) for m in reversed(messages) if m.type == "human"), "")
+        try:
+            bundle = json.loads(last_human)
+            bundle = bundle if isinstance(bundle, dict) else {}
+        except ValueError:
+            bundle = {}
+        if bundle.get("WORKFLOW_BUILDER_BUNDLE") is True:
+            from backend.workflow_assistant import demo_proposal
+
+            return ChatResult(
+                generations=[ChatGeneration(message=AIMessage(content=dump(demo_proposal(json.loads(last_human)))))]
+            )
         project_match = re.search(r"PRJ-\d{4}", last_human)
         project_id = project_match.group(0) if project_match else "PRJ-1001"
         last_human_idx = max((i for i, m in enumerate(messages) if m.type == "human"), default=0)
@@ -45,7 +57,17 @@ class DemoChatModel(BaseChatModel):
                     evidence = json.loads(str(tool_results[-1].content))
                 except ValueError:
                     pass
-            if "EVALUATION_BUNDLE" in last_human:
+            if bundle.get("GENERIC_WORKFLOW_BUNDLE") is True:
+                inputs = bundle["inputs"]
+                material = inputs.get("data") if isinstance(inputs.get("data"), dict) else {}
+                orders = inputs.get("orders", material.get("orders", []))
+                counts = {
+                    status: sum(o.get("status") == status for o in orders) for status in ("paid", "shipped", "pending")
+                }
+                content = {
+                    "summary": f"离线演示摘要：客户 {inputs.get('customer_id', material.get('customer_id', ''))} 共 {len(orders)} 笔订单，已支付 {counts['paid']} 笔、已发货 {counts['shipped']} 笔、待支付 {counts['pending']} 笔。"
+                }
+            elif bundle.get("EVALUATION_BUNDLE") is True:
                 content = Assessment(
                     assessment="SUPPORTED",
                     summary="离线规则演示：根据提供的证据索引整理检查结论，不代表真实模型评审。",
@@ -70,27 +92,29 @@ class DemoChatModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
-def model_mode():
-    return os.getenv("MODEL_MODE", "demo")
+def model_mode(config=None):
+    return config.mode if config is not None else os.getenv("MODEL_MODE", "demo")
 
 
-def get_model():
-    mode = model_mode()
+def get_model(config=None):
+    config = config or ModelConfig.from_environment()
+    mode = model_mode(config)
     if mode == "demo":
         return DemoChatModel()
     if mode == "unavailable":
         raise BusinessError("MODEL_UNAVAILABLE", "模型不可用（故障演示模式）")
-    if not os.getenv("OPENAI_API_KEY"):
-        raise BusinessError("MODEL_UNAVAILABLE", "请在后端 .env 配置 OPENAI_API_KEY")
+    require_model_key(config)
     from langchain_openai import ChatOpenAI
 
+    options = {"temperature": config.temperature} if config.temperature is not None else {}
     return ChatOpenAI(
-        model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-        api_key=os.environ["OPENAI_API_KEY"],
-        base_url=os.getenv("OPENAI_BASE_URL") or None,
-        timeout=35,
+        model=config.model,
+        api_key=config.api_key.get_secret_value() or "local-no-key",
+        base_url=config.base_url,
+        timeout=config.timeout_seconds,
         max_retries=0,
-        max_tokens=1800,
+        max_tokens=config.max_tokens,
+        **options,
     )
 
 

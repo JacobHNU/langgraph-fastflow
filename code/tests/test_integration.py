@@ -107,6 +107,13 @@ def test_real_graph_templates(client, agent):
     events = client.get(f"/api/runs/{run_id}/event-log").json()
     assert events[0]["event_type"] == "run.created"
     assert len({e["sequence"] for e in events}) == len(events)
+    calls = [e for e in events if e["event_type"] == "model.called"]
+    responses = [e for e in events if e["event_type"] == "model.completed"]
+    assert len(calls) == len(responses) == run["usage"]["model_calls"]
+    for call, response in zip(calls, responses, strict=True):
+        assert call["payload"]["call_id"] == response["payload"]["call_id"]
+        assert "messages" in client.get(f"/api/evidence/{call['evidence_refs'][0]}").json()["data"]
+        assert "response" in client.get(f"/api/evidence/{response['evidence_refs'][0]}").json()["data"]
     if agent == "project-assistant":
         assert len(run["children"]) == 1
 

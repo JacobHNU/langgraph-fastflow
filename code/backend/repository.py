@@ -34,6 +34,7 @@ def redact(value: Any) -> Any:
         return {
             k: "[REDACTED]"
             if any(s in k.lower() for s in ("api_key", "secret", "password", "authorization", "access_token"))
+            and not (k in ("requires_api_key", "api_key_configured") and isinstance(v, bool))
             else redact(v)
             for k, v in value.items()
         }
@@ -62,6 +63,43 @@ class Repository:
             CREATE INDEX IF NOT EXISTS events_run ON events(run_id,sequence);
         """)
         self.db.commit()
+        self._number_existing_evidence()
+
+    def _number_existing_evidence(self):
+        with self.transaction():
+            groups = {}
+            for item in self.list("evidence"):
+                groups.setdefault(item["run_id"], []).append(item)
+            for items in groups.values():
+                number = max((e.get("number", 0) for e in items), default=0)
+                for item in sorted(items, key=lambda e: (e.get("created_at", ""), e["id"])):
+                    if not item.get("number"):
+                        number += 1
+                        self.put("evidence", item["id"], {**item, "number": number})
+
+    def evidence_index(self, run_id):
+        run = self.get("run", run_id) or {}
+        nodes = {n["id"]: n.get("title", n["id"]) for n in run.get("workflow", {}).get("nodes", [])}
+        labels = {
+            "model.called": "模型输入",
+            "model.completed": "模型响应",
+            "node.completed": "节点结果",
+            "tool.completed": "工具结果",
+            "operation.reconciled": "读回对账",
+        }
+        kinds = {
+            ref: labels.get(e["event_type"], "执行证据")
+            for e in self.events(run_id)
+            for ref in e.get("evidence_refs", [])
+        }
+        return sorted(
+            [
+                {**e, "title": f"{kinds.get(e['id'], '上下文记录')} · {nodes.get(e['node_id'], e['node_id'])}"}
+                for e in self.list("evidence")
+                if e["run_id"] == run_id
+            ],
+            key=lambda e: e["number"],
+        )
 
     def put(self, kind: str, key: str, value: dict) -> dict:
         with self.transaction():
@@ -159,7 +197,11 @@ class Repository:
             value["storage"] = "file"
         else:
             value["storage"] = "sqlite"
-        self.put("evidence", evidence_id, value)
+        with self.transaction():
+            value["number"] = (
+                max((e.get("number", 0) for e in self.list("evidence") if e["run_id"] == run_id), default=0) + 1
+            )
+            self.put("evidence", evidence_id, value)
         return evidence_id
 
     def close(self):

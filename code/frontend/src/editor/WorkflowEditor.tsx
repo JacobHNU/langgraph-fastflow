@@ -24,6 +24,8 @@ import {
   Loader2,
   Circle,
   AlertCircle,
+  Globe,
+  UserCheck,
 } from 'lucide-react';
 import '@flowgram.ai/free-layout-editor/index.css';
 import { createFreeLinesPlugin } from '@flowgram.ai/free-lines-plugin';
@@ -41,6 +43,8 @@ const icons: Record<string, typeof Bot> = {
   llm: Sparkles,
   managed_agent: Layers,
   subworkflow: Layers,
+  http: Globe,
+  human_input: UserCheck,
 };
 export const NodeIcon = ({ type, size = 18 }: { type: string; size?: number }) => {
   const Icon = icons[type] || Circle;
@@ -94,9 +98,11 @@ function WorkflowNode({ node }: { node: WorkflowNodeEntity }) {
         <div className="node-description">
           {String(
             spec.config.function_ref ||
+              spec.config.operation_ref ||
+              spec.config.validator_ref ||
               spec.config.executor ||
               (spec.type === 'input'
-                ? 'ProjectQueryInput'
+                ? '业务入口参数'
                 : spec.type === 'verify'
                   ? '确定性检查 · 证据读回'
                   : spec.type === 'approval'

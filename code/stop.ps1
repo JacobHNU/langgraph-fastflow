@@ -1,5 +1,10 @@
+param([string]$DataDir = '')
 $ErrorActionPreference = 'Stop'
-$demoPidFile = Join-Path $PSScriptRoot 'data/server.pid'
+$demoDataRoot = if ($DataDir) {
+    if ([IO.Path]::IsPathRooted($DataDir)) { [IO.Path]::GetFullPath($DataDir) }
+    else { [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $DataDir)) }
+} else { Join-Path $PSScriptRoot 'data' }
+$demoPidFile = Join-Path $demoDataRoot 'server.pid'
 if (-not (Test-Path -LiteralPath $demoPidFile)) { Write-Host 'No managed server PID file found.'; return }
 $demoServerId = [int](Get-Content -LiteralPath $demoPidFile)
 $demoServerProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$demoServerId" -ErrorAction SilentlyContinue

@@ -1,0 +1,180 @@
+{
+  "schema_version": "2.0",
+  "workflow_id": "customer-order-summary",
+  "entry_node": "n_input",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "customer_id": {
+        "type": "string",
+        "title": "客户编号",
+        "pattern": "^CUST-[0-9]{4}$"
+      }
+    },
+    "required": ["customer_id"],
+    "additionalProperties": false
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "summary": { "type": "string", "minLength": 1 },
+      "approved": { "type": "boolean" }
+    },
+    "required": ["summary", "approved"],
+    "additionalProperties": false
+  },
+  "state_fields": [],
+  "nodes": [
+    {
+      "id": "n_input",
+      "type": "input",
+      "type_version": "1",
+      "title": "输入客户编号",
+      "inputs": {},
+      "config": {}
+    },
+    {
+      "id": "n_orders",
+      "type": "http",
+      "type_version": "1",
+      "title": "查询客户订单",
+      "inputs": {
+        "customer_id": { "source": "node", "node_id": "n_input", "path": ["customer_id"] }
+      },
+      "config": {
+        "connection_ref": "conn_orders@1",
+        "operation_ref": "orders.list@1",
+        "on_error": "fail"
+      },
+      "timeout_ms": 10000,
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "status": { "type": "integer" },
+          "data": {
+            "type": "object",
+            "properties": {
+              "customer_id": { "type": "string" },
+              "orders": {
+                "type": "array",
+                "maxItems": 100,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": { "type": "string" },
+                    "status": { "type": "string" }
+                  },
+                  "required": ["id", "status"],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": ["customer_id", "orders"],
+            "additionalProperties": false
+          },
+          "meta": { "type": "object" }
+        },
+        "required": ["ok", "status", "data", "meta"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "n_summary",
+      "type": "llm",
+      "type_version": "1",
+      "title": "生成订单摘要",
+      "inputs": {
+        "customer_id": { "source": "node", "node_id": "n_input", "path": ["customer_id"] },
+        "orders": { "source": "node", "node_id": "n_orders", "path": ["data", "orders"] }
+      },
+      "config": {
+        "executor": "direct_model",
+        "model_ref": "model_default@1",
+        "system_prompt": "根据已提供的订单数据生成简短摘要，不补充未提供的订单事实。返回符合输出 Schema 的 JSON。",
+        "user_prompt_template": "客户 {{ customer_id }} 的订单为 {{ orders | tojson }}，请生成摘要。"
+      },
+      "timeout_ms": 35000,
+      "output_schema": {
+        "type": "object",
+        "properties": { "summary": { "type": "string", "minLength": 1, "maxLength": 4000 } },
+        "required": ["summary"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "n_verify",
+      "type": "verify",
+      "type_version": "1",
+      "title": "核验数据与摘要结构",
+      "inputs": {
+        "customer_id": { "source": "node", "node_id": "n_input", "path": ["customer_id"] },
+        "response": { "source": "node", "node_id": "n_orders", "path": [] },
+        "analysis": { "source": "node", "node_id": "n_summary", "path": [] }
+      },
+      "config": { "validator_ref": "order-summary@1", "on_failure": "fail" }
+    },
+    {
+      "id": "n_review",
+      "type": "human_input",
+      "type_version": "1",
+      "title": "人工确认摘要",
+      "inputs": {
+        "summary": { "source": "node", "node_id": "n_summary", "path": ["summary"] },
+        "verification": { "source": "node", "node_id": "n_verify", "path": [] }
+      },
+      "config": {
+        "mode": "review",
+        "reject_behavior": "cancel",
+        "form_schema": {
+          "type": "object",
+          "properties": { "feedback": { "type": "string", "title": "反馈", "maxLength": 2000 } },
+          "additionalProperties": false
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "accepted": { "type": "boolean" },
+          "feedback": { "type": "string" }
+        },
+        "required": ["accepted"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "n_output",
+      "type": "output",
+      "type_version": "1",
+      "title": "输出确认后的摘要",
+      "inputs": {
+        "summary": { "source": "node", "node_id": "n_summary", "path": ["summary"] },
+        "approved": { "source": "node", "node_id": "n_review", "path": ["accepted"] }
+      },
+      "config": {}
+    }
+  ],
+  "edges": [
+    { "from": "n_input", "to": "n_orders" },
+    { "from": "n_orders", "to": "n_summary" },
+    { "from": "n_summary", "to": "n_verify" },
+    { "from": "n_verify", "to": "n_review" },
+    { "from": "n_review", "to": "n_output" }
+  ],
+  "policy": {
+    "capability_refs": ["orders.list@1"],
+    "resource_scopes": ["orders:customer"],
+    "max_model_calls": 6,
+    "max_tool_calls": 6,
+    "active_timeout_ms": 120000
+  },
+  "dependency_refs": {
+    "connections": ["conn_orders@1"],
+    "models": ["model_default@1"],
+    "validators": ["order-summary@1"],
+    "tools": ["orders.list@1"],
+    "skills": [],
+    "subgraphs": []
+  },
+  "evaluation_ref": "generic-result-evaluation@1"
+}

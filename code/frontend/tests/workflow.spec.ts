@@ -39,6 +39,7 @@ test('query runs through LangGraph, streams events and displays evidence/evaluat
 
 test('node form, drag, save and immutable publishing from the actual canvas', async ({ page }) => {
   await open(page);
+  await page.getByTitle('新建工作流菜单', { exact: true }).click();
   await page.getByTitle('复制当前流程为新草稿').click();
   await expect(page.locator('.workflow-breadcrumb')).toContainText('副本');
   const target = page.locator('.workflow-node[data-node-id="n_query"]');
@@ -68,6 +69,7 @@ test('node form, drag, save and immutable publishing from the actual canvas', as
 
 test('add a Python node and reconnect the graph through visual ports', async ({ page }) => {
   await open(page);
+  await page.getByTitle('新建工作流菜单', { exact: true }).click();
   await page.getByTitle('复制当前流程为新草稿').click();
   await expect(page.locator('.workflow-breadcrumb')).toContainText('副本');
   await page.getByTitle('添加节点').click();

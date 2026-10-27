@@ -6,6 +6,8 @@ export type NodeSpec = {
   inputs: Record<string, unknown>;
   config: Record<string, any>;
   timeout_ms?: number;
+  input_schema?: Record<string, any> | null;
+  output_schema?: Record<string, any> | null;
 };
 export type Workflow = {
   schema_version: string;
@@ -13,13 +15,26 @@ export type Workflow = {
   entry_node: string;
   nodes: NodeSpec[];
   edges: { from: string; to: string; branch?: string }[];
-  policy: { tools: string[]; objects: string[]; max_model_calls: number; max_tool_calls: number };
+  policy: {
+    tools?: string[];
+    objects?: string[];
+    capability_refs?: string[];
+    resource_scopes?: string[];
+    active_timeout_ms?: number;
+    max_model_calls: number;
+    max_tool_calls: number;
+  };
+  input_schema?: Record<string, any> | null;
+  output_schema?: Record<string, any> | null;
+  dependency_refs?: Record<string, string[]>;
+  state_fields?: Record<string, any>[];
   skill_refs?: string[];
   child_agent_refs?: { agent_id: string; version: string }[];
   evaluation_ref: string;
 };
 export type Layout = Record<string, { x: number; y: number }>;
 export type Agent = {
+  deleted_at?: string | null;
   id: string;
   name: string;
   description: string;
@@ -53,8 +68,10 @@ export type Run = {
   layout: Layout;
   created_at: string;
   duration_ms?: number;
+  active_elapsed_ms?: number;
   node_results: Record<string, any>;
   approvals: any[];
+  input_requests?: any[];
   operations: any[];
   children: any[];
   usage: { model_calls: number; tool_calls: number };
@@ -62,7 +79,7 @@ export type Run = {
   cancel_requested: boolean;
 };
 export type Registry = {
-  nodes: { type: string; label: string; description: string }[];
+  nodes: { type: string; label: string; description: string; schema_versions?: string[] }[];
   functions: Record<string, { label: string; effect: string; required: string[] }>;
   skills: { id: string; name: string; content: string; sha256: string; tools: string[] }[];
 };
@@ -90,11 +107,14 @@ export const labels: Record<string, string> = {
   output: '输出',
   managed_agent: '固定子 Agent',
   subworkflow: '固定子流程',
+  http: 'HTTP 查询',
+  human_input: '人工确认',
 };
 export const statuses: Record<string, string> = {
   QUEUED: '排队中',
   RUNNING: '执行中',
   AWAITING_APPROVAL: '等待审批',
+  AWAITING_INPUT: '等待人工确认',
   SUCCEEDED: '执行成功',
   FAILED: '执行失败',
   CANCELLED: '已取消',

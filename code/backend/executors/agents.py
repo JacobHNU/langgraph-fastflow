@@ -15,8 +15,9 @@ from langchain_core.tools import tool
 from pydantic import Field
 
 from backend.executors.models import get_model, model_mode, parse_json
+from backend.model_settings import ModelConfig
 from backend.registry import skills
-from backend.repository import digest, dump
+from backend.repository import digest, dump, redact, uid
 from backend.schemas import BusinessError
 
 
@@ -38,7 +39,40 @@ class NodeBoundary(AgentMiddleware):
         filtered = [t for t in request.tools if (t.get("name") if isinstance(t, dict) else t.name) in self.allowed]
         return handler(request.override(tools=filtered))
 
-    def before_inference(self):
+    def log_message(self, message):
+        content = message.content
+        if isinstance(content, list):
+            content = [
+                {"type": block.get("type"), "text": block.get("text", "")}
+                for block in content
+                if isinstance(block, dict) and block.get("type") in ("text", "input_text", "output_text")
+            ]
+        return {
+            "role": message.type,
+            "content": content,
+            "tool_calls": getattr(message, "tool_calls", []),
+            "tool_call_id": getattr(message, "tool_call_id", None),
+        }
+
+    def log_payload(self, data):
+        config = self.context.get("model_config") or ModelConfig.from_environment()
+        secret = config.api_key.get_secret_value()
+
+        def sanitize(value):
+            if isinstance(value, str):
+                return value.replace(secret, "[REDACTED]") if secret else value
+            if isinstance(value, list):
+                return [sanitize(v) for v in value]
+            if isinstance(value, dict):
+                return {k: sanitize(v) for k, v in value.items()}
+            return value
+
+        data = sanitize(redact(data))
+        ref = self.repo.evidence(self.context["run_id"], self.context["node_id"], data)
+        encoded = dump(data)
+        return {"evidence_ref": ref, "preview": encoded[:2400], "truncated": len(encoded) > 2400}
+
+    def before_inference(self, messages):
         self.check()
         limit = self.context["policy"].get("max_model_calls", 6)
         if self.usage["model_calls"] >= limit or self.usage["tokens"] >= 24000:
@@ -49,14 +83,26 @@ class NodeBoundary(AgentMiddleware):
         if sum(e["payload"].get("tokens", 0) for e in events if e["event_type"] == "model.completed") >= 80000:
             raise BusinessError("BUDGET_EXCEEDED", "本次运行 token 总预算耗尽")
         self.usage["model_calls"] += 1
+        call_id = uid("call")
+        config = self.context.get("model_config") or ModelConfig.from_environment()
+        payload = self.log_payload({"messages": [self.log_message(m) for m in messages]})
         self.repo.event(
             self.context["run_id"],
             "model.called",
             self.context["node_id"],
-            {"mode": model_mode(), "call": self.usage["model_calls"], "allowed_tools": sorted(self.allowed)},
+            {
+                "mode": model_mode(self.context.get("model_config")),
+                "call": self.usage["model_calls"],
+                "call_id": call_id,
+                "model": config.model if config.mode == "openai" else "demo-model",
+                "allowed_tools": sorted(self.allowed),
+                **payload,
+            },
+            evidence_refs=[payload["evidence_ref"]],
         )
+        return call_id
 
-    def after_inference(self, message, messages, duration_ms):
+    def after_inference(self, message, messages, duration_ms, call_id):
         usage = getattr(message, "usage_metadata", None)
         tokens = (
             usage.get("total_tokens", 0)
@@ -64,19 +110,37 @@ class NodeBoundary(AgentMiddleware):
             else (sum(len(str(m.content)) for m in messages) + len(str(message.content))) // 3 + 1
         )
         self.usage["tokens"] += tokens
+        payload = self.log_payload({"response": self.log_message(message)})
         self.repo.event(
             self.context["run_id"],
             "model.completed",
             self.context["node_id"],
             {
+                "call_id": call_id,
                 "tokens": tokens,
-                "estimated": not bool(usage) or model_mode() == "demo",
+                "estimated": not bool(usage) or model_mode(self.context.get("model_config")) == "demo",
                 "duration_ms": round(duration_ms, 2),
+                **payload,
             },
+            evidence_refs=[payload["evidence_ref"]],
         )
         if self.usage["tokens"] > 24000:
             raise BusinessError("BUDGET_EXCEEDED", "模型 token 用量超过预算")
         self.check()
+
+    def failed_inference(self, error, duration_ms, call_id):
+        self.repo.event(
+            self.context["run_id"],
+            "model.failed",
+            self.context["node_id"],
+            {
+                "call_id": call_id,
+                "duration_ms": round(duration_ms, 2),
+                "code": error.code if isinstance(error, BusinessError) else "MODEL_CALL_FAILED",
+                "message": "模型调用失败，请检查模型连接、服务商状态或调用预算。",
+                "error_type": type(error).__name__,
+            },
+        )
 
     def wrap_tool_call(self, request, handler):
         self.check()
@@ -108,15 +172,20 @@ class MeteredChatModel(BaseChatModel):
         return self.model_copy(update={"delegate": self.delegate.bind_tools(tools, **kwargs)})
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-        self.boundary.before_inference()
+        call_id = self.boundary.before_inference(messages)
         started = time.monotonic()
-        message = self.delegate.invoke(messages, stop=stop, **kwargs)
-        self.boundary.after_inference(message, messages, (time.monotonic() - started) * 1000)
+        try:
+            message = self.delegate.invoke(messages, stop=stop, **kwargs)
+        except Exception as error:
+            self.boundary.failed_inference(error, (time.monotonic() - started) * 1000, call_id)
+            raise
+        self.boundary.after_inference(message, messages, (time.monotonic() - started) * 1000, call_id)
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
 def execute_model(node, inputs, context, repo, business_tools):
-    model = get_model()
+    model = get_model(context.get("model_config"))
+    mode = model_mode(context.get("model_config"))
     selected_skills = [s for s in skills() if s["id"] in node.config.get("skills", [])]
     for skill in selected_skills:
         if context["skill_hashes"].get(skill["id"]) != skill["sha256"]:
@@ -130,7 +199,7 @@ def execute_model(node, inputs, context, repo, business_tools):
         model = MeteredChatModel(delegate=model, boundary=boundary)
         response = model.invoke([SystemMessage(content=system), HumanMessage(content=task)])
         data = parse_json(response.content)
-        return {**data, "model_mode": model_mode(), "executor": executor, "usage": boundary.usage}
+        return {**data, "model_mode": mode, "executor": executor, "usage": boundary.usage}
 
     @tool
     def query_project(project_id: str) -> dict:
@@ -200,7 +269,7 @@ def execute_model(node, inputs, context, repo, business_tools):
         )
     return {
         **data,
-        "model_mode": model_mode(),
+        "model_mode": mode,
         "executor": executor,
         "usage": boundary.usage,
         "context_messages": len(result["messages"]),

@@ -31,6 +31,17 @@ import {
 import { WorkflowEditor, NodeIcon, type EditorHandle } from './editor/WorkflowEditor';
 import { Inspector } from './editor/Inspector';
 import { RunMonitor, Status } from './run-monitor/RunMonitor';
+import { WorkspaceSettings } from './settings/WorkspaceSettings';
+import { SchemaForm, validateForm } from './SchemaForm';
+import { ResizableHandle } from './ResizableHandle';
+import {
+  MetadataDialog,
+  NewWorkflowDialog,
+  NewWorkflowMenu,
+  WorkflowManager,
+  WorkflowRowMenu,
+} from './WorkflowManagement';
+import { WorkflowAssistant, stable, type Snapshot } from './WorkflowAssistant';
 import {
   api,
   labels,
@@ -78,6 +89,8 @@ export default function App() {
   const [conversationId, setConversationId] = useState(() => crypto.randomUUID()),
     [keepContext, setKeepContext] = useState(true),
     [simulateUnknown, setSimulateUnknown] = useState(false);
+  const [genericInputs, setGenericInputs] = useState<any>({});
+  const [selectedRelease, setSelectedRelease] = useState<any>(null);
   const [modal, setModal] = useState<string | null>(null),
     [publishInfo, setPublishInfo] = useState<any>(null),
     [versions, setVersions] = useState<any[]>([]),
@@ -86,6 +99,14 @@ export default function App() {
     [validationErrors, setValidationErrors] = useState<any[]>([]),
     [jsonText, setJsonText] = useState('');
   const editor = useRef<EditorHandle>(null);
+  const [newDialog, setNewDialog] = useState(false);
+  const [managementTarget, setManagementTarget] = useState<Agent | null>(null);
+  const [pendingAction, setPendingAction] = useState<{ action: () => void } | null>(null);
+  const [rightTab, setRightTab] = useState('config');
+  const [assistantBackup, setAssistantBackup] = useState<{
+    snapshot: Snapshot;
+    name: string;
+  } | null>(null);
   const notice = useCallback((text: string, error = false) => setToast({ text, error }), []);
   const handleError = useCallback(
     (e: unknown) => notice(e instanceof Error ? e.message : String(e), true),
@@ -105,21 +126,34 @@ export default function App() {
     setMonitor(false);
     setSelectedNode(null);
     setValidationErrors([]);
+    setAssistantBackup(null);
+    setRunId(null);
+    setEvents([]);
     setEpoch((e) => e + 1);
     setNav('editor');
     window.history.replaceState(null, '', location.pathname);
   };
   useEffect(() => {
     const targetRun = new URLSearchParams(location.search).get('run');
+    const targetSettings = new URLSearchParams(location.search).get('settings');
+    const targetWorkflow = new URLSearchParams(location.search).get('workflow');
     Promise.all([api<Agent[]>('/agents'), api<Registry>('/node-types'), api('/health')])
       .then(async ([list, reg, h]) => {
         setAgents(list);
         setRegistry(reg);
         setHealth(h);
-        choose(list.find((a) => a.id === 'project-status') || list[0]);
+        if (list.length)
+          choose(
+            list.find((a) => a.id === targetWorkflow) ||
+              list.find((a) => a.id === 'project-status') ||
+              list[0],
+          );
+        if (targetSettings === 'models') setNav('settings');
         if (targetRun) {
           const detail = await api<Run>(`/runs/${targetRun}`);
-          const bound = list.find((a) => a.id === detail.agent_id);
+          const bound =
+            list.find((a) => a.id === detail.agent_id) ||
+            (await api<Agent>(`/agents/${detail.agent_id}`));
           if (bound) choose(bound);
           setRun(detail);
           setRunId(detail.id);
@@ -130,6 +164,44 @@ export default function App() {
       .catch(handleError);
   }, []);
   useEffect(() => {
+    setSelectedRelease(null);
+    if (!agent || !runVersion) return;
+    let active = true;
+    api<any[]>(`/agents/${agent.id}/versions`)
+      .then((list) => {
+        const release = list.find((v) => v.version === runVersion);
+        if (!active || !release) return;
+        setSelectedRelease(release);
+        const properties = release.workflow.input_schema?.properties || {};
+        setGenericInputs(
+          Object.fromEntries(
+            Object.entries(properties).flatMap(([key, raw]) => {
+              const field = raw as any;
+              return field.default !== undefined
+                ? [[key, field.default]]
+                : key === 'customer_id'
+                  ? [[key, 'CUST-1001']]
+                  : [];
+            }),
+          ),
+        );
+      })
+      .catch(handleError);
+    return () => {
+      active = false;
+    };
+  }, [agent?.id, runVersion]);
+  useEffect(() => {
+    const warn = (e: BeforeUnloadEvent) => {
+      if (dirty && !monitor) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [dirty, monitor]);
+  useEffect(() => {
     if (toast) {
       const timer = setTimeout(() => setToast(null), 5000);
       return () => clearTimeout(timer);
@@ -138,6 +210,13 @@ export default function App() {
   useEffect(() => {
     if (nav === 'runs') api<Run[]>('/runs').then(setHistory).catch(handleError);
   }, [nav, run?.status]);
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    if (nav === 'settings') params.set('settings', 'models');
+    else params.delete('settings');
+    const query = params.toString();
+    window.history.replaceState(null, '', location.pathname + (query ? `?${query}` : ''));
+  }, [nav]);
   useEffect(() => {
     if (!runId) return;
     let disposed = false;
@@ -163,6 +242,8 @@ export default function App() {
           'approval.requested',
           'evaluation.completed',
           'approval.resolved',
+          'input.requested',
+          'input.resolved',
           'run.started',
         ].includes(event.event_type)
       )
@@ -182,6 +263,11 @@ export default function App() {
     };
   }, [runId]);
   const isActive = Boolean(run && run.agent_id === agent?.id && !terminal.includes(run.status));
+  const releaseReady = Boolean(
+    selectedRelease &&
+      selectedRelease.agent_id === agent?.id &&
+      selectedRelease.version === runVersion,
+  );
   const visibleWorkflow = monitor && run ? run.workflow : workflow;
   const visibleLayout = monitor && run ? run.layout : layout;
   const node = visibleWorkflow?.nodes.find((n) => n.id === selectedNode);
@@ -198,6 +284,10 @@ export default function App() {
       const a = run.approvals?.find((a) => a.status === 'PENDING');
       if (a) nodeStates[a.node_id] = 'waiting';
     }
+    if (run?.status === 'AWAITING_INPUT') {
+      const pending = run.input_requests?.find((r) => r.status === 'PENDING');
+      if (pending) nodeStates[pending.node_id] = 'waiting';
+    }
   }
 
   const save = async () => {
@@ -206,6 +296,7 @@ export default function App() {
     const snap = editor.current?.snapshot() || { workflow, layout };
     const saved = await api<Agent>(`/agents/${agent.id}/draft`, 'PUT', {
       revision: agent.revision,
+      name: agent.name,
       ...snap,
     });
     setAgent(saved);
@@ -257,12 +348,22 @@ export default function App() {
   const launch = () =>
     perform(async () => {
       if (!agent || !runVersion) throw new Error('请先发布一个流程版本');
+      if (
+        !selectedRelease ||
+        selectedRelease.agent_id !== agent.id ||
+        selectedRelease.version !== runVersion
+      )
+        throw new Error('发布版本正在加载，请稍后重试');
+      const generic = selectedRelease.workflow.schema_version === '2.0';
+      if (generic) validateForm(selectedRelease.workflow.input_schema, genericInputs);
       const result = await api('/runs', 'POST', {
         agent_id: agent.id,
         version: runVersion,
-        inputs: { project_id: projectId, progress, task, simulate_unknown: simulateUnknown },
+        inputs: generic
+          ? genericInputs
+          : { project_id: projectId, progress, task, simulate_unknown: simulateUnknown },
         idempotency_key: crypto.randomUUID(),
-        conversation_id: keepContext ? conversationId : null,
+        conversation_id: !generic && keepContext ? conversationId : null,
       });
       const detail = await api<Run>(`/runs/${result.id}`);
       setRun(detail);
@@ -279,7 +380,9 @@ export default function App() {
   const loadRun = async (item: Run) => {
     try {
       const detail = await api<Run>(`/runs/${item.id}`);
-      const a = agents.find((a) => a.id === detail.agent_id);
+      const a =
+        agents.find((a) => a.id === detail.agent_id) ||
+        (await api<Agent>(`/agents/${detail.agent_id}`));
       if (a) choose(a);
       setRun(detail);
       setEvents([]);
@@ -294,14 +397,87 @@ export default function App() {
     }
   };
   const edit = () => {
+    if (agent?.deleted_at) {
+      notice('工作流已在回收站，请先恢复', true);
+      return;
+    }
     setMonitor(false);
     setSelectedNode(null);
     setEpoch((e) => e + 1);
   };
-  const applyNode = (spec: NodeSpec) => {
+  const applyNode = async (spec: NodeSpec, patch?: Partial<Workflow>) => {
+    const previous = workflow?.nodes.find((n) => n.id === spec.id);
+    const priorTools = [
+      ...(previous?.config.tools || []),
+      ...(previous?.config.operation_ref ? [previous.config.operation_ref] : []),
+    ];
+    const addedTools = [
+      ...(spec.config.tools || []),
+      ...(spec.config.operation_ref ? [spec.config.operation_ref] : []),
+    ].filter((ref) => !priorTools.includes(ref));
+    let connections: any[] = [];
+    if (workflow?.schema_version === '2.0') {
+      try {
+        connections = await api<any[]>('/connections');
+      } catch (e) {
+        handleError(e);
+        return;
+      }
+    }
     editor.current?.update(spec);
     const snap = editor.current?.snapshot();
     if (snap) {
+      if (patch) Object.assign(snap.workflow, patch);
+      if (snap.workflow.schema_version === '2.0') {
+        const refs = (key: string) =>
+          Array.from(
+            new Set(snap.workflow.nodes.map((n) => n.config[key]).filter(Boolean)),
+          ) as string[];
+        const tools = Array.from(
+          new Set(
+            snap.workflow.nodes.flatMap((n) => [
+              ...(n.config.tools || []),
+              ...(n.type === 'http' && n.config.operation_ref ? [n.config.operation_ref] : []),
+            ]),
+          ),
+        ) as string[];
+        const toolConnections = [
+          ...(snap.workflow.dependency_refs?.connections || []),
+          ...connections
+            .filter((c) =>
+              c.operations.some(
+                (op: any) =>
+                  addedTools.includes(op.id) && (spec.config.tools || []).includes(op.id),
+              ),
+            )
+            .map((c) => c.ref),
+        ];
+        const hasAgentTools = snap.workflow.nodes.some((n) => (n.config.tools || []).length);
+        snap.workflow.dependency_refs = {
+          models: refs('model_ref'),
+          connections: Array.from(
+            new Set([...refs('connection_ref'), ...(hasAgentTools ? toolConnections : [])]),
+          ),
+          validators: refs('validator_ref'),
+          tools,
+          skills: [],
+          subgraphs: [],
+        };
+        snap.workflow.policy = {
+          ...snap.workflow.policy,
+          capability_refs: Array.from(
+            new Set([...(snap.workflow.policy.capability_refs || []), ...addedTools]),
+          ).filter((ref) => tools.includes(ref)),
+          resource_scopes: Array.from(
+            new Set([
+              ...(snap.workflow.policy.resource_scopes || []),
+              ...addedTools.map((ref) =>
+                ref === 'orders.list@1' ? 'orders:customer' : 'http:registered',
+              ),
+            ]),
+          ),
+        };
+      }
       if (spec.config.skills?.length)
         snap.workflow.skill_refs = Array.from(
           new Set([...(snap.workflow.skill_refs || []), ...spec.config.skills]),
@@ -312,7 +488,7 @@ export default function App() {
     setDirty(true);
     notice('节点配置已应用');
   };
-  const addNode = (type: string) => {
+  const addNode = async (type: string) => {
     const id = 'n_' + type + '_' + Math.random().toString(36).slice(2, 6);
     const config: Record<string, any> = {};
     let inputs: Record<string, unknown> = {};
@@ -340,12 +516,73 @@ export default function App() {
       config.compare_to = 60;
       inputs = { value: { source: 'constant', value: 60 } };
     }
-    const spec = { id, type, type_version: '1', title: labels[type], inputs, config };
+    if (type === 'verify' || type === 'output')
+      inputs = { result: { source: 'constant', value: {} } };
+    if (type === 'output') inputs.verification = { source: 'constant', value: {} };
+    const spec: NodeSpec = { id, type, type_version: '1', title: labels[type], inputs, config };
+    if (workflow?.schema_version === '2.0') {
+      try {
+        if (type === 'llm' || type === 'agent') {
+          const profiles = await api<any[]>('/model-profiles');
+          spec.config = {
+            executor: type === 'llm' ? 'direct_model' : 'langchain_agent',
+            tools: [],
+            model_ref: profiles.find((p) => p.id === 'model_default')?.ref,
+            system_prompt: '根据输入生成简短摘要，不补充未提供的事实。',
+            user_prompt_template: '{{ data | tojson }}',
+          };
+          spec.inputs = { data: { source: 'input', path: [] } };
+          spec.output_schema = {
+            type: 'object',
+            properties: { summary: { type: 'string', minLength: 1 } },
+            required: ['summary'],
+            additionalProperties: false,
+          };
+          spec.timeout_ms = 120000;
+        }
+        if (type === 'http') {
+          const connections = await api<any[]>('/connections');
+          const c = connections[0],
+            op = c?.operations[0];
+          spec.config = { connection_ref: c?.ref, operation_ref: op?.id };
+          spec.inputs = Object.fromEntries(
+            Object.keys(op?.input_schema.properties || {}).map((key) => [
+              key,
+              { source: 'input', path: [key] },
+            ]),
+          );
+          spec.output_schema = op?.response_schema;
+        }
+        if (type === 'verify') {
+          spec.config = { validator_ref: 'schema@1', schema: { type: 'object' } };
+          spec.inputs = { value: { source: 'constant', value: {} } };
+        }
+        if (type === 'human_input') {
+          spec.config = {
+            mode: 'review',
+            reject_behavior: 'cancel',
+            form_schema: {
+              type: 'object',
+              properties: { feedback: { type: 'string', title: '反馈', maxLength: 2000 } },
+              additionalProperties: false,
+            },
+          };
+          spec.inputs = { summary: { source: 'constant', value: '' } };
+        }
+        if (type === 'output') spec.inputs = {};
+      } catch (e) {
+        handleError(e);
+        return;
+      }
+    }
     editor.current?.add(spec);
-    const snap = editor.current?.snapshot();
-    if (snap) {
-      setWorkflow(snap.workflow);
-      setLayout(snap.layout);
+    if (workflow?.schema_version === '2.0') await applyNode(spec);
+    else {
+      const snap = editor.current?.snapshot();
+      if (snap) {
+        setWorkflow(snap.workflow);
+        setLayout(snap.layout);
+      }
     }
     setDirty(true);
     setSelectedNode(id);
@@ -370,6 +607,181 @@ export default function App() {
       choose(created);
       notice('已创建独立草稿');
     });
+  const guard = (action: () => void) => {
+    if (dirty && !monitor) setPendingAction({ action });
+    else action();
+  };
+  const getSnapshot = (): Snapshot => editor.current?.snapshot() || { workflow: workflow!, layout };
+  const copyAgent = (target: Agent) =>
+    guard(() => {
+      void perform(async () => {
+        const snap =
+          target.id === agent?.id
+            ? getSnapshot()
+            : { workflow: target.workflow, layout: target.layout };
+        const created = await api<Agent>('/agents', 'POST', {
+          name: `${target.name} · 副本`,
+          ...snap,
+        });
+        await refreshAgents();
+        choose(created);
+        notice('已创建独立草稿');
+      });
+    });
+  const managementChanged = async (changed: Agent) => {
+    const list = await refreshAgents();
+    if (agent?.id === changed.id) {
+      if (changed.deleted_at) {
+        if (list.length) choose(list[0]);
+        else {
+          setAgent(null);
+          setWorkflow(null);
+          setDirty(false);
+          setRunId(null);
+          setNav('agents');
+        }
+      } else setAgent(changed);
+    } else if (!agent && list.length) choose(list[0]);
+    notice(changed.deleted_at ? '已移入回收站' : '工作流已更新');
+  };
+  const applyProposal = async (proposal: any) => {
+    if (!agent || monitor || agent.deleted_at) throw new Error('请先打开可编辑草稿');
+    const latest = await api<Agent>(`/agents/${agent.id}`);
+    if (
+      proposal.agent_id !== agent.id ||
+      latest.deleted_at ||
+      latest.revision !== proposal.base_revision ||
+      agent.revision !== proposal.base_revision ||
+      (proposal.base_name != null && proposal.base_name !== agent.name) ||
+      stable(getSnapshot()) !== stable(proposal.base_snapshot)
+    ) {
+      throw new Error('草稿已变化，此提案已过期，请根据当前画布重新生成');
+    }
+    setAssistantBackup({ snapshot: structuredClone(getSnapshot()), name: agent.name });
+    const snap = { workflow: proposal.workflow, layout: proposal.layout };
+    editor.current?.replace(snap.workflow, snap.layout);
+    setWorkflow(snap.workflow);
+    setLayout(snap.layout);
+    setAgent({ ...agent, name: proposal.name });
+    setDirty(true);
+    setValidationErrors([]);
+    setSelectedNode(null);
+    notice('修改已应用到草稿，尚未保存');
+    requestAnimationFrame(() => requestAnimationFrame(() => editor.current?.fit()));
+  };
+  const createProposal = async (proposal: any) => {
+    const create = async () => {
+      const created = await api<Agent>('/agents', 'POST', {
+        name: proposal.name,
+        workflow: proposal.workflow,
+        layout: proposal.layout,
+      });
+      await refreshAgents();
+      choose(created);
+      notice('已创建工作流草稿');
+    };
+    if (dirty && !monitor) {
+      setPendingAction({
+        action: () => {
+          void perform(create);
+        },
+      });
+      return;
+    }
+    await create();
+  };
+  const newWorkflow = () => guard(() => setNewDialog(true));
+  const manageWorkflow = (target: Agent) =>
+    guard(() => {
+      void perform(async () => setManagementTarget(await api<Agent>(`/agents/${target.id}`)));
+    });
+  const selectAgent = (target: Agent) =>
+    guard(() => {
+      void perform(async () => choose(await api<Agent>(`/agents/${target.id}`)));
+    });
+  const management = (
+    <WorkflowManager
+      agents={agents}
+      onOpen={selectAgent}
+      onNew={newWorkflow}
+      onCopy={copyAgent}
+      onManage={manageWorkflow}
+      onChanged={(a) => {
+        void managementChanged(a);
+      }}
+    />
+  );
+  const workflowDialogs = (
+    <>
+      {newDialog && (
+        <NewWorkflowDialog
+          onClose={() => setNewDialog(false)}
+          onCreated={(created) => {
+            setNewDialog(false);
+            void refreshAgents();
+            choose(created);
+            notice('已创建工作流草稿');
+          }}
+        />
+      )}
+      {managementTarget && (
+        <MetadataDialog
+          key={managementTarget.id}
+          agent={managementTarget}
+          onClose={() => setManagementTarget(null)}
+          onChanged={(changed) => {
+            void managementChanged(changed);
+          }}
+        />
+      )}
+      {pendingAction && (
+        <div className="modal-backdrop">
+          <div className="modal small-modal" role="dialog" aria-label="未保存的修改">
+            <div className="modal-header">
+              <h2>草稿有未保存的修改</h2>
+            </div>
+            <div className="modal-footer">
+              <button className="secondary" onClick={() => setPendingAction(null)}>
+                取消
+              </button>
+              <button
+                className="secondary"
+                onClick={() => {
+                  const action = pendingAction.action;
+                  setPendingAction(null);
+                  setDirty(false);
+                  if (agent) {
+                    const saved = agents.find((a) => a.id === agent.id) || agent;
+                    setAgent(saved);
+                    setWorkflow(structuredClone(saved.workflow));
+                    setLayout(saved.layout);
+                    setEpoch((n) => n + 1);
+                  }
+                  action();
+                }}
+              >
+                放弃修改
+              </button>
+              <button
+                className="primary"
+                disabled={busy}
+                onClick={() => {
+                  void perform(async () => {
+                    await save();
+                    const action = pendingAction.action;
+                    setPendingAction(null);
+                    action();
+                  });
+                }}
+              >
+                保存并继续
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
   const exportJson = () => {
     const snap = editor.current?.snapshot() || { workflow, layout };
     const url = URL.createObjectURL(new Blob([pretty(snap)], { type: 'application/json' }));
@@ -386,12 +798,42 @@ export default function App() {
       notice(decision === 'approve' ? '已批准，LangGraph 正在恢复执行' : '已拒绝操作');
     });
 
-  if (!agent || !visibleWorkflow || !registry)
+  if (!registry)
     return (
       <div className="loading-screen">
         <WorkflowIcon size={34} />
         <span>{toast?.error ? toast.text : '正在连接工作台…'}</span>
         {toast?.error && <button onClick={() => location.reload()}>重新连接</button>}
+      </div>
+    );
+  if (!agent || !visibleWorkflow)
+    return (
+      <div className="app-shell">
+        <header className="app-header">
+          <strong>Workflow Studio</strong>
+          <button onClick={() => setNav('agents')}>工作流管理</button>
+          <button onClick={() => setNav('runs')}>运行记录</button>
+          <button title="工作空间设置" onClick={() => setNav('settings')}>
+            设置
+          </button>
+        </header>
+        <main className="empty-workspace">
+          {nav === 'settings' ? (
+            <WorkspaceSettings onSaved={() => {}} />
+          ) : nav === 'runs' ? (
+            <div className="content-page">
+              <h1>运行记录</h1>
+              {history.map((r) => (
+                <button className="empty-run-link" key={r.id} onClick={() => void loadRun(r)}>
+                  {r.agent_name} · {r.id} · {statuses[r.status]}
+                </button>
+              ))}
+            </div>
+          ) : (
+            management
+          )}
+        </main>
+        {workflowDialogs}
       </div>
     );
   return (
@@ -412,7 +854,11 @@ export default function App() {
         </div>
         <nav>
           {navItems.map(([key, title, Icon]) => (
-            <button key={key} className={nav === key ? 'active' : ''} onClick={() => setNav(key)}>
+            <button
+              key={key}
+              className={nav === key ? 'active' : ''}
+              onClick={() => guard(() => setNav(key))}
+            >
               <Icon size={15} />
               {title}
             </button>
@@ -423,7 +869,11 @@ export default function App() {
             <i />
             {health ? '已连接' : '连接中'}
           </span>
-          <button className="icon-button" onClick={() => setNav('settings')} title="工作空间设置">
+          <button
+            className="icon-button"
+            onClick={() => guard(() => setNav('settings'))}
+            title="工作空间设置"
+          >
             <Settings2 size={17} />
           </button>
           <span className="avatar" title="本地演示操作员">
@@ -435,9 +885,7 @@ export default function App() {
         <aside className="sidebar">
           <div className="sidebar-heading">
             <span>业务工作流</span>
-            <button className="icon-button" title="复制当前流程为新草稿" onClick={duplicate}>
-              <Plus size={17} />
-            </button>
+            <NewWorkflowMenu onNew={newWorkflow} onCopy={() => guard(duplicate)} />
           </div>
           <div className="sidebar-search">
             <Search size={14} />
@@ -455,34 +903,37 @@ export default function App() {
             {agents
               .filter((a) => a.name.includes(search) || a.id.includes(search))
               .map((a) => (
-                <button
-                  className={`agent-link ${a.id === agent.id ? 'active' : ''}`}
-                  key={a.id}
-                  onClick={() => choose(a)}
-                >
-                  <span className={`agent-symbol ${a.category}`}>
-                    <NodeIcon
-                      type={
-                        a.category === 'analysis' || a.category === 'deep'
-                          ? 'agent'
-                          : a.category === 'approval'
-                            ? 'approval'
-                            : a.category === 'branch'
-                              ? 'condition'
-                              : a.category === 'child'
-                                ? 'managed_agent'
-                                : a.category === 'model'
-                                  ? 'llm'
-                                  : 'python'
-                      }
-                    />
-                  </span>
-                  <span>
-                    <strong>{a.name}</strong>
-                    <small>{a.latest_version ? 'v' + a.latest_version : '未发布草稿'}</small>
-                  </span>
-                  <ChevronRight size={12} />
-                </button>
+                <div className="agent-list-item" key={a.id}>
+                  <button
+                    className={`agent-link ${a.id === agent.id ? 'active' : ''}`}
+                    key={a.id}
+                    onClick={() => selectAgent(a)}
+                  >
+                    <span className={`agent-symbol ${a.category}`}>
+                      <NodeIcon
+                        type={
+                          a.category === 'analysis' || a.category === 'deep'
+                            ? 'agent'
+                            : a.category === 'approval'
+                              ? 'approval'
+                              : a.category === 'branch'
+                                ? 'condition'
+                                : a.category === 'child'
+                                  ? 'managed_agent'
+                                  : a.category === 'model'
+                                    ? 'llm'
+                                    : 'python'
+                        }
+                      />
+                    </span>
+                    <span>
+                      <strong>{a.name}</strong>
+                      <small>{a.latest_version ? 'v' + a.latest_version : '未发布草稿'}</small>
+                    </span>
+                    <ChevronRight size={12} />
+                  </button>
+                  <WorkflowRowMenu agent={a} onManage={manageWorkflow} onCopy={copyAgent} />
+                </div>
               ))}
           </div>
           <div className="sidebar-bottom">
@@ -496,6 +947,14 @@ export default function App() {
             <span className="online-dot" />
           </div>
         </aside>
+        <ResizableHandle
+          name="调整左侧列表宽度"
+          target=".sidebar"
+          variable="--sidebar-width"
+          min={180}
+          max={320}
+          reserve={806}
+        />
         <main className="main-area">
           {nav === 'editor' ? (
             <>
@@ -511,7 +970,7 @@ export default function App() {
                 </div>
                 <div className="workflow-actions">
                   {monitor ? (
-                    <button className="secondary" onClick={edit}>
+                    <button className="secondary" onClick={edit} disabled={!!agent.deleted_at}>
                       <Code2 size={14} />
                       编辑草稿
                     </button>
@@ -542,8 +1001,8 @@ export default function App() {
                   )}
                   <button
                     className="primary run-button"
-                    disabled={busy || isActive || !runVersion}
-                    onClick={launch}
+                    disabled={busy || isActive || !releaseReady}
+                    onClick={() => guard(launch)}
                   >
                     {busy ? (
                       <Loader2 size={14} className="spin" />
@@ -710,6 +1169,16 @@ export default function App() {
                       </div>
                     )}
                   </section>
+                  <ResizableHandle
+                    name="调整执行结果高度"
+                    target=".run-monitor"
+                    variable="--monitor-height"
+                    axis="y"
+                    reverse
+                    min={160}
+                    max={900}
+                    reserve={246}
+                  />
                   <RunMonitor
                     run={run?.agent_id === agent.id ? run : null}
                     events={run?.agent_id === agent.id ? events : []}
@@ -721,6 +1190,21 @@ export default function App() {
                       editor.current?.focus(id);
                     }}
                     onApproval={approve}
+                    onInput={async (pending, decision, payload) => {
+                      try {
+                        await api(`/runs/${runId}/inputs/${pending.id}`, 'POST', {
+                          revision: pending.revision,
+                          decision,
+                          payload,
+                          idempotency_key: crypto.randomUUID(),
+                        });
+                        setRun(await api(`/runs/${runId}`));
+                        notice(decision === 'accept' ? '已确认，继续执行' : '已拒绝，取消运行');
+                      } catch (e) {
+                        handleError(e);
+                        throw e;
+                      }
+                    }}
                     onRetry={() =>
                       perform(async () => {
                         await api(`/runs/${runId}/evaluation/retry`, 'POST');
@@ -742,240 +1226,253 @@ export default function App() {
                     }
                   />
                 </div>
+                <ResizableHandle
+                  name="调整右侧配置宽度"
+                  target=".right-panel"
+                  variable="--inspector-width"
+                  reverse
+                  min={250}
+                  max={520}
+                  reserve={406}
+                />
                 <aside className="right-panel">
-                  {node ? (
-                    <Inspector
-                      key={`${node.id}:${monitor}`}
-                      node={node}
-                      workflow={visibleWorkflow}
-                      registry={registry}
-                      onApply={applyNode}
-                      onDelete={() => {
-                        editor.current?.remove(node.id);
-                        const snap = editor.current?.snapshot();
-                        if (snap) {
-                          setWorkflow(snap.workflow);
-                          setLayout(snap.layout);
-                        }
-                        setSelectedNode(null);
-                        setDirty(true);
-                      }}
-                      onClose={() => setSelectedNode(null)}
-                      readonly={monitor}
-                      result={run?.node_results?.[node.id]}
-                    />
-                  ) : (
-                    <div className="run-config">
-                      <div className="panel-heading">
-                        <span>
-                          <Play size={15} />
-                          运行配置
-                        </span>
-                        <span className="tag">v{runVersion || '—'}</span>
-                      </div>
-                      <div className="run-config-body">
-                        <div className="config-section-title">业务输入</div>
-                        <div className="field">
-                          <label htmlFor="project-id">项目</label>
-                          <select
-                            id="project-id"
-                            value={projectId}
-                            onChange={(e) => setProjectId(e.target.value)}
-                          >
-                            <option value="PRJ-1001">PRJ-1001 · 企业门户升级</option>
-                            <option value="PRJ-1002">PRJ-1002 · 客户服务平台</option>
-                          </select>
+                  <div className="right-panel-tabs panel-segments">
+                    <button
+                      className={rightTab === 'config' ? 'active' : ''}
+                      onClick={() => setRightTab('config')}
+                    >
+                      配置
+                    </button>
+                    <button
+                      className={rightTab === 'chat' ? 'active' : ''}
+                      onClick={() => setRightTab('chat')}
+                    >
+                      对话
+                    </button>
+                  </div>
+                  <div className="right-panel-content">
+                    {rightTab === 'chat' ? (
+                      <WorkflowAssistant
+                        key={agent.id}
+                        agent={agent}
+                        readonly={monitor || !!agent.deleted_at}
+                        getSnapshot={getSnapshot}
+                        onApply={applyProposal}
+                        onCreate={createProposal}
+                        onEdit={edit}
+                        canUndo={!!assistantBackup && !monitor}
+                        onUndo={() => {
+                          if (!assistantBackup) return;
+                          editor.current?.replace(
+                            assistantBackup.snapshot.workflow,
+                            assistantBackup.snapshot.layout,
+                          );
+                          setWorkflow(assistantBackup.snapshot.workflow);
+                          setLayout(assistantBackup.snapshot.layout);
+                          setAgent({ ...agent, name: assistantBackup.name });
+                          setDirty(true);
+                          setAssistantBackup(null);
+                          notice('已撤销此次应用');
+                        }}
+                      />
+                    ) : node ? (
+                      <Inspector
+                        key={`${node.id}:${monitor}`}
+                        node={node}
+                        workflow={visibleWorkflow}
+                        registry={registry}
+                        onApply={applyNode}
+                        onDelete={() => {
+                          editor.current?.remove(node.id);
+                          const snap = editor.current?.snapshot();
+                          if (snap) {
+                            setWorkflow(snap.workflow);
+                            setLayout(snap.layout);
+                          }
+                          setSelectedNode(null);
+                          setDirty(true);
+                        }}
+                        onClose={() => setSelectedNode(null)}
+                        readonly={monitor}
+                        result={run?.node_results?.[node.id]}
+                      />
+                    ) : (
+                      <div className="run-config">
+                        <div className="panel-heading">
+                          <span>
+                            <Play size={15} />
+                            运行配置
+                          </span>
+                          <span className="tag">v{runVersion || '—'}</span>
                         </div>
-                        {agent.category === 'approval' && (
-                          <>
-                            <div className="field">
-                              <label htmlFor="target-progress">目标进度（%）</label>
-                              <input
-                                type="number"
-                                id="target-progress"
-                                min="0"
-                                max="100"
-                                value={progress}
-                                onChange={(e) => setProgress(Number(e.target.value))}
-                              />
+                        <div className="run-config-body">
+                          <div className="config-section-title">业务输入</div>
+                          {(selectedRelease?.workflow || workflow)?.schema_version === '2.0' ? (
+                            <SchemaForm
+                              key={`${agent.id}:${runVersion}`}
+                              schema={(selectedRelease?.workflow || workflow).input_schema}
+                              value={genericInputs}
+                              onChange={setGenericInputs}
+                            />
+                          ) : (
+                            <>
+                              <div className="field">
+                                <label htmlFor="project-id">项目</label>
+                                <select
+                                  id="project-id"
+                                  value={projectId}
+                                  onChange={(e) => setProjectId(e.target.value)}
+                                >
+                                  <option value="PRJ-1001">PRJ-1001 · 企业门户升级</option>
+                                  <option value="PRJ-1002">PRJ-1002 · 客户服务平台</option>
+                                </select>
+                              </div>
+                              {agent.category === 'approval' && (
+                                <>
+                                  <div className="field">
+                                    <label htmlFor="target-progress">目标进度（%）</label>
+                                    <input
+                                      type="number"
+                                      id="target-progress"
+                                      min="0"
+                                      max="100"
+                                      value={progress}
+                                      onChange={(e) => setProgress(Number(e.target.value))}
+                                    />
+                                  </div>
+                                  <label className="checkbox-row">
+                                    <input
+                                      type="checkbox"
+                                      checked={simulateUnknown}
+                                      onChange={(e) => setSimulateUnknown(e.target.checked)}
+                                    />
+                                    模拟提交后响应丢失
+                                  </label>
+                                </>
+                              )}
+                              {['analysis', 'deep', 'model'].includes(agent.category) && (
+                                <>
+                                  <div className="field">
+                                    <label htmlFor="task-input">任务材料</label>
+                                    <textarea
+                                      id="task-input"
+                                      rows={5}
+                                      value={task}
+                                      onChange={(e) => setTask(e.target.value)}
+                                    />
+                                  </div>
+                                  <label className="checkbox-row">
+                                    <input
+                                      type="checkbox"
+                                      checked={keepContext}
+                                      onChange={(e) => setKeepContext(e.target.checked)}
+                                    />
+                                    延续当前业务上下文
+                                  </label>
+                                  <button
+                                    className="text-button new-context"
+                                    onClick={() => {
+                                      setConversationId(crypto.randomUUID());
+                                      notice('已创建新的独立业务会话');
+                                    }}
+                                  >
+                                    新建会话
+                                    <ArrowRight size={12} />
+                                  </button>
+                                </>
+                              )}
+                            </>
+                          )}
+                          <div className="config-section-title second">执行约束</div>
+                          <dl className="config-facts">
+                            <div>
+                              <dt>发布版本</dt>
+                              <dd>v{runVersion || '未发布'}</dd>
                             </div>
-                            <label className="checkbox-row">
-                              <input
-                                type="checkbox"
-                                checked={simulateUnknown}
-                                onChange={(e) => setSimulateUnknown(e.target.checked)}
-                              />
-                              模拟提交后响应丢失
-                            </label>
-                          </>
-                        )}
-                        {['analysis', 'deep', 'model'].includes(agent.category) && (
-                          <>
-                            <div className="field">
-                              <label htmlFor="task-input">任务材料</label>
-                              <textarea
-                                id="task-input"
-                                rows={5}
-                                value={task}
-                                onChange={(e) => setTask(e.target.value)}
-                              />
+                            <div>
+                              <dt>执行引擎</dt>
+                              <dd>LangGraph</dd>
                             </div>
-                            <label className="checkbox-row">
-                              <input
-                                type="checkbox"
-                                checked={keepContext}
-                                onChange={(e) => setKeepContext(e.target.checked)}
-                              />
-                              延续当前业务上下文
-                            </label>
-                            <button
-                              className="text-button new-context"
-                              onClick={() => {
-                                setConversationId(crypto.randomUUID());
-                                notice('已创建新的独立业务会话');
-                              }}
-                            >
-                              新建会话
-                              <ArrowRight size={12} />
-                            </button>
-                          </>
-                        )}
-                        <div className="config-section-title second">执行约束</div>
-                        <dl className="config-facts">
-                          <div>
-                            <dt>发布版本</dt>
-                            <dd>v{runVersion || '未发布'}</dd>
-                          </div>
-                          <div>
-                            <dt>执行引擎</dt>
-                            <dd>LangGraph</dd>
-                          </div>
-                          <div>
-                            <dt>模型预算</dt>
-                            <dd>{workflow?.policy.max_model_calls} 次 / 节点</dd>
-                          </div>
-                          <div>
-                            <dt>工具预算</dt>
-                            <dd>{workflow?.policy.max_tool_calls} 次 / 节点</dd>
-                          </div>
-                          <div>
-                            <dt>结果核验</dt>
-                            <dd>
-                              <CheckCircle2 size={12} />
-                              已启用
-                            </dd>
-                          </div>
-                        </dl>
-                        <div className="config-section-title second">绑定能力</div>
-                        <div className="capability-tags">
-                          {(workflow?.skill_refs || []).map((s) => (
-                            <span className="tag" key={s}>
-                              <BookOpen size={12} />
-                              {s}
-                            </span>
-                          ))}
-                          {workflow?.policy.tools.map((t) => (
-                            <span className="capability" key={t}>
-                              <Code2 size={12} />
-                              {t}
-                            </span>
-                          ))}
-                        </div>
-                        {monitor && run && (
-                          <div className="current-run">
-                            <span className="config-section-title">当前运行</span>
-                            <Status status={run.status} />
-                            <code>{run.id}</code>
-                            {isActive && (
-                              <button
-                                className="secondary danger"
-                                disabled={run.cancel_requested}
-                                onClick={() =>
-                                  perform(async () => {
-                                    await api(`/runs/${runId}/cancel`, 'POST');
-                                    setRun(await api(`/runs/${runId}`));
-                                    notice('已请求取消，等待执行边界确认');
-                                  })
-                                }
-                              >
-                                <Square size={12} />
-                                {run.cancel_requested ? '等待停止确认' : '请求取消'}
-                              </button>
+                            <div>
+                              <dt>模型预算</dt>
+                              <dd>{workflow?.policy.max_model_calls} 次 / 节点</dd>
+                            </div>
+                            <div>
+                              <dt>工具预算</dt>
+                              <dd>{workflow?.policy.max_tool_calls} 次 / 节点</dd>
+                            </div>
+                            <div>
+                              <dt>结果核验</dt>
+                              <dd>
+                                <CheckCircle2 size={12} />
+                                已启用
+                              </dd>
+                            </div>
+                          </dl>
+                          <div className="config-section-title second">绑定能力</div>
+                          <div className="capability-tags">
+                            {(workflow?.skill_refs || []).map((s) => (
+                              <span className="tag" key={s}>
+                                <BookOpen size={12} />
+                                {s}
+                              </span>
+                            ))}
+                            {(workflow?.policy.capability_refs || workflow?.policy.tools || []).map(
+                              (t) => (
+                                <span className="capability" key={t}>
+                                  <Code2 size={12} />
+                                  {t}
+                                </span>
+                              ),
                             )}
                           </div>
-                        )}
+                          {monitor && run && (
+                            <div className="current-run">
+                              <span className="config-section-title">当前运行</span>
+                              <Status status={run.status} />
+                              <code>{run.id}</code>
+                              {isActive && (
+                                <button
+                                  className="secondary danger"
+                                  disabled={run.cancel_requested}
+                                  onClick={() =>
+                                    perform(async () => {
+                                      await api(`/runs/${runId}/cancel`, 'POST');
+                                      setRun(await api(`/runs/${runId}`));
+                                      notice('已请求取消，等待执行边界确认');
+                                    })
+                                  }
+                                >
+                                  <Square size={12} />
+                                  {run.cancel_requested ? '等待停止确认' : '请求取消'}
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                        <div className="run-config-footer">
+                          <button
+                            className="primary"
+                            disabled={busy || isActive || !releaseReady}
+                            onClick={() => guard(launch)}
+                          >
+                            <Play size={14} fill="currentColor" />
+                            {busy ? '创建中…' : '运行工作流'}
+                          </button>
+                          <span>
+                            {dirty
+                              ? '当前存在未发布的草稿修改'
+                              : `运行已发布版本 v${runVersion || '—'}`}
+                          </span>
+                        </div>
                       </div>
-                      <div className="run-config-footer">
-                        <button
-                          className="primary"
-                          disabled={busy || isActive || !runVersion}
-                          onClick={launch}
-                        >
-                          <Play size={14} fill="currentColor" />
-                          {busy ? '创建中…' : '运行工作流'}
-                        </button>
-                        <span>
-                          {dirty
-                            ? '当前存在未发布的草稿修改'
-                            : `运行已发布版本 v${runVersion || '—'}`}
-                        </span>
-                      </div>
-                    </div>
-                  )}
+                    )}
+                  </div>
                 </aside>
               </div>
             </>
           ) : nav === 'agents' ? (
-            <div className="content-page">
-              <div className="page-heading">
-                <div>
-                  <span className="eyebrow">WORKSPACE</span>
-                  <h1>业务 Agent</h1>
-                </div>
-                <button className="primary" onClick={duplicate}>
-                  <Plus size={15} />
-                  新建副本
-                </button>
-              </div>
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>业务 Agent</th>
-                    <th>工作流</th>
-                    <th>节点</th>
-                    <th>发布版本</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {agents.map((a) => (
-                    <tr key={a.id}>
-                      <td>
-                        <strong>{a.name}</strong>
-                        <small>{a.description}</small>
-                      </td>
-                      <td>
-                        <code>{a.id}</code>
-                      </td>
-                      <td>{a.workflow.nodes.length}</td>
-                      <td>
-                        {a.latest_version ? (
-                          <span className="tag green">v{a.latest_version}</span>
-                        ) : (
-                          <span className="tag">草稿</span>
-                        )}
-                      </td>
-                      <td>
-                        <button className="text-button" onClick={() => choose(a)}>
-                          打开
-                          <ArrowRight size={13} />
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            management
           ) : nav === 'runs' ? (
             <div className="content-page">
               <div className="page-heading">
@@ -1012,7 +1509,15 @@ export default function App() {
                       <td>{statuses[r.evaluation_status]}</td>
                       <td>{new Date(r.created_at).toLocaleString('zh-CN', { hour12: false })}</td>
                       <td>
-                        <button className="icon-button" title="查看运行" onClick={() => loadRun(r)}>
+                        <button
+                          className="icon-button"
+                          title="查看运行"
+                          onClick={() =>
+                            guard(() => {
+                              void loadRun(r);
+                            })
+                          }
+                        >
                           <ArrowRight size={16} />
                         </button>
                       </td>
@@ -1060,6 +1565,11 @@ export default function App() {
                   <h1>工作空间设置</h1>
                 </div>
               </div>
+              <WorkspaceSettings
+                onSaved={() => {
+                  api('/health').then(setHealth).catch(handleError);
+                }}
+              />
               <div className="settings-section">
                 <h2>当前环境</h2>
                 <dl className="config-facts">
@@ -1111,6 +1621,7 @@ export default function App() {
         </span>
         <span>{monitor && run ? statuses[run.status] : dirty ? '草稿有修改' : '就绪'}</span>
       </footer>
+      {workflowDialogs}
       {toast && (
         <div className={`toast ${toast.error ? 'error' : ''}`} role="status">
           {toast.error ? <X size={16} /> : <CheckCircle2 size={16} />}
@@ -1147,7 +1658,21 @@ export default function App() {
             {modal === 'nodes' ? (
               <div className="node-palette">
                 {registry.nodes
-                  .filter((n) => n.type !== 'input')
+                  .filter(
+                    (n) =>
+                      n.type !== 'input' &&
+                      (workflow?.schema_version === '2.0'
+                        ? [
+                            'http',
+                            'llm',
+                            'agent',
+                            'verify',
+                            'human_input',
+                            'condition',
+                            'output',
+                          ].includes(n.type)
+                        : !n.schema_versions || n.schema_versions.includes('1.0')),
+                  )
                   .map((n) => (
                     <button key={n.type} onClick={() => addNode(n.type)}>
                       <span className={`node-icon ${n.type}`}>
@@ -1260,28 +1785,56 @@ export default function App() {
                 <div className="modal-body">
                   <div className="field">
                     <label>工具白名单</label>
-                    {Object.entries(registry.functions).map(([key, fn]) => (
-                      <label className="checkbox-row" key={key}>
-                        <input
-                          type="checkbox"
-                          checked={workflow.policy.tools.includes(key)}
-                          onChange={(e) => {
-                            const next = {
-                              ...workflow,
-                              policy: {
-                                ...workflow.policy,
-                                tools: e.target.checked
-                                  ? [...workflow.policy.tools, key]
-                                  : workflow.policy.tools.filter((t) => t !== key),
-                              },
-                            };
-                            setWorkflow(next);
-                            setDirty(true);
-                          }}
-                        />
-                        {fn.label} <code>{fn.effect}</code>
-                      </label>
-                    ))}
+                    {workflow.schema_version === '2.0' ? (
+                      (workflow.dependency_refs?.tools || []).map((key) => (
+                        <label className="checkbox-row" key={key}>
+                          <input
+                            type="checkbox"
+                            checked={(workflow.policy.capability_refs || []).includes(key)}
+                            onChange={(e) => {
+                              setWorkflow({
+                                ...workflow,
+                                policy: {
+                                  ...workflow.policy,
+                                  capability_refs: e.target.checked
+                                    ? [...(workflow.policy.capability_refs || []), key]
+                                    : (workflow.policy.capability_refs || []).filter(
+                                        (ref) => ref !== key,
+                                      ),
+                                },
+                              });
+                              setDirty(true);
+                            }}
+                          />
+                          {key}
+                        </label>
+                      ))
+                    ) : (
+                      <>
+                        {Object.entries(registry.functions).map(([key, fn]) => (
+                          <label className="checkbox-row" key={key}>
+                            <input
+                              type="checkbox"
+                              checked={(workflow.policy.tools || []).includes(key)}
+                              onChange={(e) => {
+                                const next = {
+                                  ...workflow,
+                                  policy: {
+                                    ...workflow.policy,
+                                    tools: e.target.checked
+                                      ? [...(workflow.policy.tools || []), key]
+                                      : (workflow.policy.tools || []).filter((t) => t !== key),
+                                  },
+                                };
+                                setWorkflow(next);
+                                setDirty(true);
+                              }}
+                            />
+                            {fn.label} <code>{fn.effect}</code>
+                          </label>
+                        ))}
+                      </>
+                    )}
                   </div>
                   {(['max_model_calls', 'max_tool_calls'] as const).map((k) => (
                     <div className="field" key={k}>
@@ -1304,28 +1857,78 @@ export default function App() {
                     </div>
                   ))}
                   <div className="field">
-                    <label>项目授权</label>
-                    {['PRJ-1001', 'PRJ-1002'].map((id) => (
-                      <label className="checkbox-row" key={id}>
-                        <input
-                          type="checkbox"
-                          checked={workflow.policy.objects.includes(id)}
-                          onChange={(e) => {
-                            setWorkflow({
-                              ...workflow,
-                              policy: {
-                                ...workflow.policy,
-                                objects: e.target.checked
-                                  ? [...workflow.policy.objects, id]
-                                  : workflow.policy.objects.filter((o) => o !== id),
-                              },
-                            });
-                            setDirty(true);
-                          }}
-                        />
-                        {id}
-                      </label>
-                    ))}
+                    {workflow.schema_version === '2.0' ? (
+                      <>
+                        <label>资源作用域</label>
+                        {['orders:customer', 'http:registered'].map((scope) => (
+                          <label className="checkbox-row" key={scope}>
+                            <input
+                              type="checkbox"
+                              checked={(workflow.policy.resource_scopes || []).includes(scope)}
+                              onChange={(e) => {
+                                setWorkflow({
+                                  ...workflow,
+                                  policy: {
+                                    ...workflow.policy,
+                                    resource_scopes: e.target.checked
+                                      ? [...(workflow.policy.resource_scopes || []), scope]
+                                      : (workflow.policy.resource_scopes || []).filter(
+                                          (ref) => ref !== scope,
+                                        ),
+                                  },
+                                });
+                                setDirty(true);
+                              }}
+                            />
+                            {scope}
+                          </label>
+                        ))}
+                        <div className="field">
+                          <label>活动执行预算（毫秒）</label>
+                          <input
+                            type="number"
+                            min={1000}
+                            max={900000}
+                            value={workflow.policy.active_timeout_ms || 120000}
+                            onChange={(e) => {
+                              setWorkflow({
+                                ...workflow,
+                                policy: {
+                                  ...workflow.policy,
+                                  active_timeout_ms: Number(e.target.value),
+                                },
+                              });
+                              setDirty(true);
+                            }}
+                          />
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <label>项目授权</label>
+                        {['PRJ-1001', 'PRJ-1002'].map((id) => (
+                          <label className="checkbox-row" key={id}>
+                            <input
+                              type="checkbox"
+                              checked={(workflow.policy.objects || []).includes(id)}
+                              onChange={(e) => {
+                                setWorkflow({
+                                  ...workflow,
+                                  policy: {
+                                    ...workflow.policy,
+                                    objects: e.target.checked
+                                      ? [...(workflow.policy.objects || []), id]
+                                      : (workflow.policy.objects || []).filter((o) => o !== id),
+                                  },
+                                });
+                                setDirty(true);
+                              }}
+                            />
+                            {id}
+                          </label>
+                        ))}
+                      </>
+                    )}
                   </div>
                 </div>
                 <div className="modal-footer">

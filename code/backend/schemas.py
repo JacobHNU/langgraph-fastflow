@@ -18,6 +18,8 @@ class Node(BaseModel):
         "output",
         "managed_agent",
         "subworkflow",
+        "http",
+        "human_input",
     ]
     type_version: Literal["1"] = "1"
     title: str = ""
@@ -26,6 +28,8 @@ class Node(BaseModel):
     timeout_ms: int = Field(default=30000, ge=100, le=120000)
     input_schema_ref: str | None = None
     output_schema_ref: str | None = None
+    input_schema: dict[str, Any] | None = None
+    output_schema: dict[str, Any] | None = None
 
 
 class Edge(BaseModel):
@@ -37,7 +41,7 @@ class Edge(BaseModel):
 
 class Workflow(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    schema_version: Literal["1.0"] = "1.0"
+    schema_version: Literal["1.0", "2.0"] = "1.0"
     workflow_id: str = Field(pattern=r"^[a-z][a-z0-9-]{0,63}$")
     entry_node: str
     nodes: list[Node] = Field(min_length=2, max_length=40)
@@ -50,9 +54,13 @@ class Workflow(BaseModel):
             "max_tool_calls": 6,
         }
     )
-    evaluation_ref: Literal["project-evaluation@1"] = "project-evaluation@1"
+    evaluation_ref: str = "project-evaluation@1"
     skill_refs: list[str] = Field(default_factory=list)
     child_agent_refs: list[dict[str, str]] = Field(default_factory=list)
+    input_schema: dict[str, Any] | None = None
+    output_schema: dict[str, Any] | None = None
+    state_fields: list[dict[str, Any]] = Field(default_factory=list)
+    dependency_refs: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class DraftRequest(BaseModel):
