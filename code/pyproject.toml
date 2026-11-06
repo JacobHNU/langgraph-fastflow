@@ -3,11 +3,20 @@ name = "workflow-studio-demo"
 version = "0.1.0"
 requires-python = ">=3.12,<3.14"
 dependencies = [
-  "fastapi>=0.115,<1", "uvicorn>=0.34,<1", "pydantic>=2.10,<3",
-  "langgraph>=1,<2", "langgraph-checkpoint-sqlite>=3,<4",
-  "langchain>=1,<2", "langchain-openai>=1,<2", "deepagents>=0.4,<1",
-  "python-dotenv>=1,<2", "httpx>=0.28,<1",
-  "jsonschema>=4.23,<5", "jinja2>=3.1.6,<4", "rfc8785>=0.1.4,<1",
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.34,<1",
+  "pydantic>=2.10,<3",
+  "langgraph>=1,<2",
+  "langgraph-checkpoint-sqlite>=3,<4",
+  "langchain>=1,<2",
+  "langchain-openai>=1,<2",
+  "deepagents>=0.4,<1",
+  "python-dotenv>=1,<2",
+  "httpx>=0.28,<1",
+  "jsonschema>=4.23,<5",
+  "jinja2>=3.1.6,<4",
+  "rfc8785>=0.1.4,<1",
+  "pwdlib[argon2]>=0.3,<1",
 ]
 
 [dependency-groups]
@@ -16,6 +25,7 @@ dev = ["pytest>=8,<10", "ruff>=0.12,<1"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = ["system_auth: exercise unauthenticated and multiple-user sessions"]
 
 [tool.ruff]
 line-length = 120

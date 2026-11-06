@@ -26,13 +26,16 @@ const eventNames: Record<string, string> = {
   'model.binding': '模型版本绑定',
   'input.requested': '等待人工确认',
   'input.resolved': '人工确认已处理',
+  'input.closed': '人工确认已关闭',
   'approval.requested': '等待审批',
   'approval.resolved': '审批已处理',
+  'approval.closed': '审批已关闭',
   'verification.completed': '核验完成',
   'run.finished': '运行结束',
   'evaluation.started': '开始评估',
   'evaluation.completed': '评估完成',
   'model.called': '模型调用',
+  'skill.loaded': '装载 Skill',
   'model.completed': '模型响应',
   'model.failed': '模型调用失败',
   'branch.selected': '分支选择',
@@ -247,6 +250,21 @@ export function RunMonitor({
             {pendingInput && run.status === 'AWAITING_INPUT' && (
               <HumanConfirmation key={pendingInput.id} request={pendingInput} onSubmit={onInput} />
             )}
+            {[...(run.input_requests || []), ...(run.approvals || [])]
+              .filter((task) => ['CANCELLED', 'EXPIRED', 'CLOSED'].includes(task.status))
+              .map((task) => (
+                <div className="approval-banner" key={task.id}>
+                  <FileText size={18} />
+                  <div>
+                    <strong>
+                      {task.title || '人工审批'} · {task.status === 'EXPIRED' ? '已过期' : '已关闭'}
+                    </strong>
+                    <p>
+                      原因：{task.closure_reason} · 版本 {task.revision}
+                    </p>
+                  </div>
+                </div>
+              ))}
             {result && (
               <div className="result-data">
                 {result.name && (
@@ -292,17 +310,19 @@ export function RunMonitor({
                     </ul>
                   </div>
                 )}
-                <div className="verification-line">
-                  <ShieldIcon />
-                  <span>{verification?.passed ? '业务规则核验通过' : '待核验'}</span>
-                  {verification?.checks &&
-                    Object.keys(verification.checks).map((k) => (
-                      <span className="check-name" key={k}>
-                        <Check size={12} />
-                        {k}
-                      </span>
-                    ))}
-                </div>
+                {run.entrypoint !== 'node_debug' && (
+                  <div className="verification-line">
+                    <ShieldIcon />
+                    <span>{verification?.passed ? '业务规则核验通过' : '待核验'}</span>
+                    {verification?.checks &&
+                      Object.keys(verification.checks).map((k) => (
+                        <span className="check-name" key={k}>
+                          <Check size={12} />
+                          {k}
+                        </span>
+                      ))}
+                  </div>
+                )}
                 {run.children?.length > 0 && (
                   <div className="child-results">
                     {run.children.map((c) => (
@@ -417,7 +437,10 @@ export function RunMonitor({
               <Status status={evaluation?.status || run.evaluation_status} />
               <button
                 className="secondary"
-                disabled={['PENDING', 'RUNNING'].includes(run.evaluation_status)}
+                disabled={
+                  run.entrypoint === 'node_debug' ||
+                  ['PENDING', 'RUNNING'].includes(run.evaluation_status)
+                }
                 onClick={onRetry}
               >
                 <RotateCw size={14} />

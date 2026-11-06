@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react';
+import { userScope } from './types';
 
 export function ResizableHandle({
   name,
@@ -23,7 +24,7 @@ export function ResizableHandle({
   const drag = useRef<{ start: number; size: number } | null>(null);
   const [size, setSize] = useState(min);
   const [limit, setLimit] = useState(max);
-  const key = `workflow-panel:${variable}`;
+  const key = `workflow-panel:${userScope()}:${variable}`;
   const dimension = axis === 'x' ? 'width' : 'height';
   const bounds = () =>
     Math.max(
@@ -69,7 +70,11 @@ export function ResizableHandle({
     });
     observer.observe(parent);
     observer.observe(panel);
-    return () => observer.disconnect();
+    window.addEventListener('reset-panel-layout', reset);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('reset-panel-layout', reset);
+    };
   }, [key, target, variable, dimension, min, max, reserve]);
   const coordinate = (e: PointerEvent) => (axis === 'x' ? e.clientX : e.clientY);
   const keyboard = (e: KeyboardEvent) => {

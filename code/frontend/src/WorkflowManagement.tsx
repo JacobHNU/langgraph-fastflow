@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Copy, MoreHorizontal, Pencil, Plus, RotateCcw, Search, Trash2, X } from 'lucide-react';
 import { api, type Agent } from './types';
+import { useSystem } from './system/SystemContext';
 
 export function NewWorkflowMenu({
   onNew,
@@ -18,6 +19,7 @@ export function NewWorkflowMenu({
       </summary>
       <div className="workflow-menu-items">
         <button
+          disabled={disabled}
           onClick={(e) => {
             e.currentTarget.closest('details')!.open = false;
             onNew();
@@ -273,6 +275,7 @@ export function WorkflowManager({
   onManage: (agent: Agent) => void;
   onChanged: (agent: Agent) => void;
 }) {
+  const archived = !!useSystem().workspace.archived_at;
   const [trash, setTrash] = useState(false);
   const [deleted, setDeleted] = useState<Agent[]>([]);
   const [search, setSearch] = useState('');
@@ -290,7 +293,7 @@ export function WorkflowManager({
     <div className="content-page workflow-manager">
       <div className="page-heading">
         <h1>工作流管理</h1>
-        <button className="primary" onClick={onNew}>
+        <button className="primary" disabled={archived} onClick={onNew}>
           <Plus size={15} />
           新建工作流
         </button>
@@ -347,6 +350,7 @@ export function WorkflowManager({
                     {trash ? (
                       <button
                         className="text-button"
+                        disabled={archived}
                         onClick={async () => {
                           try {
                             onChanged(
@@ -371,6 +375,7 @@ export function WorkflowManager({
                         <button
                           className="icon-button"
                           title={`复制 ${a.name}`}
+                          disabled={archived}
                           onClick={() => onCopy(a)}
                         >
                           <Copy size={14} />
@@ -378,6 +383,7 @@ export function WorkflowManager({
                         <button
                           className="icon-button"
                           title={`编辑 ${a.name}`}
+                          disabled={archived}
                           onClick={() => onManage(a)}
                         >
                           <Pencil size={14} />
@@ -385,6 +391,7 @@ export function WorkflowManager({
                         <button
                           className="icon-button"
                           title={`删除 ${a.name}`}
+                          disabled={archived}
                           onClick={() => onManage(a)}
                         >
                           <Trash2 size={14} />

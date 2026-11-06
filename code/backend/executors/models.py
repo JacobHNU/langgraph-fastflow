@@ -2,6 +2,7 @@ import json
 import os
 import re
 from typing import Any
+from urllib.parse import urlsplit
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
@@ -116,6 +117,17 @@ def get_model(config=None):
         max_tokens=config.max_tokens,
         **options,
     )
+
+
+def builder_model(config):
+    model = get_model(config)
+    if (
+        config.mode == "openai"
+        and urlsplit(config.base_url).hostname in ("dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com")
+        and config.model.lower().startswith("qwen3")
+    ):
+        return model.bind(extra_body={"enable_thinking": False}, response_format={"type": "json_object"})
+    return model
 
 
 def parse_json(content: Any) -> dict:

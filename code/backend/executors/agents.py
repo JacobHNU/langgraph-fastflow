@@ -29,6 +29,9 @@ class NodeBoundary(AgentMiddleware):
 
     def check(self):
         run = self.repo.get("run", self.context["run_id"])
+        from backend.packages import check_deployment_boundary
+
+        check_deployment_boundary(self.repo, run)
         if run.get("cancel_requested"):
             raise BusinessError("CANCELLED", "已在模型/工具边界确认取消")
         if time.monotonic() - self.started > self.context["timeout_ms"] / 1000:
@@ -220,7 +223,7 @@ def execute_model(node, inputs, context, repo, business_tools):
     ]
     conversation_key = digest(
         {
-            "actor": "local-demo-operator",
+            "actor": context.get("actor", "local-demo-operator"),
             "agent": context["agent_id"],
             "node": node.id,
             "project": inputs.get("project_id"),

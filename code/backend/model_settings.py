@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
-from backend.repository import now
+from backend.repository import digest, now
 from backend.schemas import BusinessError
 
 
@@ -79,24 +79,35 @@ class ModelSettingsRequest(BaseModel):
     model: str
     api_key: SecretStr | None = Field(default=None, max_length=4096)
     clear_api_key: bool = False
+    api_key_action: Literal["preserve", "replace", "clear"] | None = None
     requires_api_key: bool = True
     timeout_seconds: float = 35
     max_tokens: int = 1800
     temperature: float | None = None
 
+    def credential_change(self):
+        key = self.api_key.get_secret_value().strip() if self.api_key else ""
+        action = self.api_key_action or ("clear" if self.clear_api_key else "replace" if key else "preserve")
+        if (self.clear_api_key and (action != "clear" or key)) or (action != "replace" and key):
+            raise BusinessError("INPUT_INVALID", "密钥操作冲突，请选择保留、替换或清除")
+        if action == "replace" and not key:
+            raise BusinessError("INPUT_INVALID", "替换密钥时必须输入新密钥")
+        return action, key
+
 
 class ModelSettingsStore:
     """Credentials stay in the local data directory, outside workflow/audit records."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, allow_environment=True):
         self.path = root / "model-settings.json"
+        self.allow_environment = allow_environment
         self.lock = threading.RLock()
 
     def current(self) -> ModelConfig:
         with self.lock:
             if self.path.exists():
                 return ModelConfig.model_validate(json.loads(self.path.read_text(encoding="utf-8"))["config"])
-            return ModelConfig.from_environment()
+            return ModelConfig.from_environment() if self.allow_environment else ModelConfig()
 
     def public(self, config=None):
         with self.lock:
@@ -107,28 +118,61 @@ class ModelSettingsStore:
             return {
                 **config.model_dump(mode="json", exclude={"api_key"}),
                 "api_key_configured": bool(config.api_key.get_secret_value()),
-                "source": "settings" if self.path.exists() else "environment",
+                "source": "settings" if self.path.exists() else "environment" if self.allow_environment else "default",
                 "updated_at": updated_at,
             }
 
     def candidate(self, request: ModelSettingsRequest) -> ModelConfig:
+        with self.lock:
+            values = request.model_dump(exclude={"api_key", "clear_api_key", "api_key_action"})
+            config = ModelConfig.model_validate(values)
+            action, key = request.credential_change()
+            if action == "preserve":
+                key = self._credentials().get(self._scope(config), "")
+            elif action == "clear":
+                key = ""
+            return config.model_copy(update={"api_key": SecretStr(key)})
+
+    @staticmethod
+    def _scope(config):
+        # Provider + complete normalized endpoint: never reuse a key at a new destination.
+        return digest({"provider": config.provider, "base_url": config.base_url})
+
+    def _credentials(self):
+        saved = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
+        credentials = dict(saved.get("credentials", {}))
         current = self.current()
-        values = request.model_dump(exclude={"api_key", "clear_api_key"})
-        # An empty password field keeps the saved key; deletion is always explicit.
-        key = request.api_key.get_secret_value().strip() if request.api_key else ""
-        values["api_key"] = "" if request.clear_api_key else key or current.api_key.get_secret_value()
-        return ModelConfig.model_validate(values)
+        if current.api_key.get_secret_value():
+            credentials[self._scope(current)] = current.api_key.get_secret_value()
+        return credentials
+
+    def key_for(self, config):
+        with self.lock:
+            config = config if isinstance(config, ModelConfig) else ModelConfig.model_validate(config)
+            return self._credentials().get(self._scope(config), "")
+
+    def credential_values(self):
+        with self.lock:
+            return tuple(self._credentials().values())
 
     def save(self, request: ModelSettingsRequest):
         with self.lock:
+            credentials = self._credentials()
             config = self.candidate(request)
+            scope = self._scope(config)
+            if config.api_key.get_secret_value():
+                credentials[scope] = config.api_key.get_secret_value()
+            else:
+                credentials.pop(scope, None)
             values = config.model_dump(mode="json", exclude={"api_key"})
             values["api_key"] = config.api_key.get_secret_value()
             temporary = None
             try:
                 with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent, delete=False) as f:
                     temporary = Path(f.name)
-                    json.dump({"config": values, "updated_at": now()}, f, ensure_ascii=False)
+                    json.dump(
+                        {"config": values, "credentials": credentials, "updated_at": now()}, f, ensure_ascii=False
+                    )
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(temporary, self.path)

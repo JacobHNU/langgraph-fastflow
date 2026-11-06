@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
@@ -96,7 +96,7 @@ test('model settings persist securely and drive real workflow model requests', a
       ),
     ).toBeTruthy();
     expect(calls.every((c) => c.authorization === 'Bearer private-ui-key')).toBeTruthy();
-    await page.getByTitle('工作空间设置').click();
+    await page.getByTitle('系统设置').click();
     await page.getByLabel('API Key', { exact: true }).fill('rejected-ui-key');
     await page.getByRole('button', { name: '测试连接', exact: true }).click();
     await expect(page.locator('.model-feedback [role="status"]')).toContainText('认证失败');

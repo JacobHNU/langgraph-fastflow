@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 test('initial canvas visual inspection', async ({ page }) => {
   const errors: string[] = [];

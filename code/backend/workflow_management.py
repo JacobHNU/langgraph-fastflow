@@ -87,7 +87,8 @@ def register_management(app, repo):
             running = [
                 r["id"]
                 for r in repo.list("run")
-                if r["agent_id"] == agent_id and r["status"] in ("QUEUED", "RUNNING", "AWAITING_APPROVAL", "AWAITING_INPUT")
+                if r["agent_id"] == agent_id
+                and r["status"] in ("QUEUED", "RUNNING", "AWAITING_APPROVAL", "AWAITING_INPUT")
             ]
             dependencies = [
                 f"{r['name']} v{r['version']}"

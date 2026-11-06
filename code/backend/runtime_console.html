@@ -1,0 +1,1070 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>FastFlow Runtime</title>
+    <style>
+      :root {
+        font:
+          14px/1.5 system-ui,
+          sans-serif;
+        color: #24312f;
+        background: #f6f8f9;
+        --accent: #087f72;
+        --line: #dce3e6;
+      }
+      * {
+        box-sizing: border-box;
+        letter-spacing: 0;
+      }
+      body {
+        margin: 0;
+      }
+      button,
+      input,
+      select,
+      textarea {
+        font: inherit;
+      }
+      button {
+        cursor: pointer;
+        border: 1px solid var(--line);
+        background: white;
+        color: #24312f;
+        padding: 7px 12px;
+        border-radius: 5px;
+        min-height: 36px;
+      }
+      button.primary {
+        background: var(--accent);
+        color: white;
+        border-color: var(--accent);
+      }
+      button.danger {
+        color: #b52255;
+      }
+      button:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+      button:hover {
+        filter: brightness(0.96);
+      }
+      input,
+      select,
+      textarea {
+        border: 1px solid #b8c8cc;
+        border-radius: 4px;
+        padding: 8px;
+        background: white;
+        max-width: 100%;
+        min-width: 0;
+      }
+      textarea {
+        width: 100%;
+        min-height: 100px;
+        font:
+          13px/1.6 Consolas,
+          monospace;
+        resize: vertical;
+      }
+      label {
+        display: grid;
+        gap: 5px;
+        margin: 12px 0;
+      }
+      header {
+        background: #fff;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        align-items: center;
+        gap: 18px;
+        padding: 16px 28px;
+        flex-wrap: wrap;
+      }
+      header strong {
+        font-size: 20px;
+      }
+      header span {
+        font-size: 12px;
+        color: #64777d;
+      }
+      header select {
+        margin-left: auto;
+      }
+      nav {
+        display: flex;
+        gap: 6px;
+        padding: 12px 28px;
+        background: white;
+        border-bottom: 1px solid var(--line);
+        overflow: auto;
+      }
+      nav button {
+        border-color: transparent;
+        white-space: nowrap;
+      }
+      nav button.active {
+        color: var(--accent);
+        border-bottom: 2px solid var(--accent);
+        border-radius: 0;
+      }
+      main {
+        max-width: 1440px;
+        margin: auto;
+        padding: 24px 28px;
+      }
+      h1 {
+        font-size: 22px;
+        margin: 0 0 20px;
+      }
+      h2 {
+        font-size: 17px;
+        margin: 16px 0;
+      }
+      h3 {
+        font-size: 14px;
+        margin: 10px 0;
+      }
+      .split {
+        display: grid;
+        grid-template-columns: minmax(250px, 1fr) minmax(360px, 1.4fr);
+        gap: 32px;
+      }
+      .detail {
+        border-left: 1px solid var(--line);
+        padding-left: 30px;
+        min-width: 0;
+      }
+      .row {
+        border-bottom: 1px solid var(--line);
+        padding: 14px 0;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .row > div {
+        flex: 1;
+        min-width: 100px;
+      }
+      .row small {
+        display: block;
+        color: #64777d;
+        overflow-wrap: anywhere;
+      }
+      .actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: 12px 0;
+      }
+      .tag {
+        display: inline-block;
+        border-radius: 3px;
+        padding: 2px 6px;
+        background: #e7f4f0;
+        color: #076655;
+        font-size: 12px;
+      }
+      .muted {
+        color: #64777d;
+      }
+      .empty {
+        padding: 40px 0;
+        color: #64777d;
+      }
+      pre {
+        background: #edf1f4;
+        border: 1px solid var(--line);
+        padding: 12px;
+        max-height: 440px;
+        overflow: auto;
+        font-size: 12px;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        border-radius: 4px;
+      }
+      details {
+        border-bottom: 1px solid var(--line);
+        padding: 10px 0;
+      }
+      summary {
+        cursor: pointer;
+        overflow-wrap: anywhere;
+      }
+      #message {
+        position: fixed;
+        bottom: 16px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 5;
+        max-width: calc(100% - 30px);
+        padding: 12px 20px;
+        background: #173c35;
+        color: white;
+        border-radius: 5px;
+        box-shadow: 0 4px 14px #0002;
+      }
+      #message.error {
+        background: #a9224c;
+      }
+      #message:empty {
+        display: none;
+      }
+      .auth {
+        max-width: 400px;
+        margin: 8vh auto;
+      }
+      .auth h1 {
+        font-size: 28px;
+      }
+      .check {
+        display: flex;
+        align-items: start;
+        gap: 8px;
+      }
+      .check input {
+        margin-top: 5px;
+      }
+      .fields {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 0 18px;
+      }
+      .fields > .wide {
+        grid-column: 1/-1;
+      }
+      @media (max-width: 760px) {
+        header {
+          padding: 14px 16px;
+          gap: 10px;
+        }
+        header select {
+          margin-left: 0;
+          max-width: 180px;
+        }
+        nav {
+          padding: 8px 12px;
+        }
+        main {
+          padding: 18px 16px;
+        }
+        .split {
+          grid-template-columns: 1fr;
+          gap: 20px;
+        }
+        .detail {
+          border-left: 0;
+          border-top: 1px solid var(--line);
+          padding: 15px 0;
+        }
+        .fields {
+          grid-template-columns: 1fr;
+        }
+        .fields > .wide {
+          grid-column: auto;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <strong>FastFlow Runtime</strong><span>LOCAL R0 · LangGraph</span
+      ><select id="workspace" aria-label="工作区" hidden></select
+      ><button id="logout" hidden>退出登录</button>
+    </header>
+    <nav id="nav" hidden></nav>
+    <main id="main"></main>
+    <div id="message" role="status"></div>
+    <script type="module">
+      const $ = (id) => document.getElementById(id),
+        main = $("main");
+      const initial = new URLSearchParams(location.search);
+      let csrf = "",
+        ws = initial.get("workspace") || "",
+        tab = ["packages", "deployments", "runs", "resources"].includes(
+          initial.get("tab"),
+        )
+          ? initial.get("tab")
+          : "packages",
+        selection = initial.get("selected"),
+        epoch = 0,
+        timer = null,
+        toast;
+      const state = {
+        packages: [],
+        deployments: [],
+        runs: [],
+        models: [],
+        connections: [],
+      };
+      const status = {
+        READY: "待试运行",
+        ACTIVE: "已启用",
+        DISABLED: "已停用",
+        REVOKED: "已撤销",
+        QUEUED: "排队中",
+        RUNNING: "执行中",
+        AWAITING_INPUT: "等待人工确认",
+        SUCCEEDED: "执行成功",
+        FAILED: "执行失败",
+        CANCELLED: "已取消",
+        PASSED: "评估通过",
+        PENDING: "待评估",
+        RUNNING_EVALUATION: "评估中",
+        BINDING_REQUIRED: "待绑定",
+      };
+      function el(tag, text, cls) {
+        const e = document.createElement(tag);
+        if (text != null) e.textContent = text;
+        if (cls) e.className = cls;
+        return e;
+      }
+      function json(value) {
+        return JSON.stringify(value, null, 2);
+      }
+      function show(message, error = false) {
+        clearTimeout(toast);
+        $("message").textContent = message;
+        $("message").className = error ? "error" : "";
+        toast = setTimeout(() => ($("message").textContent = ""), 7000);
+      }
+      function button(text, fn, cls = "") {
+        const b = el("button", text, cls);
+        b.onclick = async () => {
+          b.disabled = true;
+          try {
+            await fn();
+          } catch (e) {
+            show(e.message, true);
+          } finally {
+            b.disabled = false;
+          }
+        };
+        return b;
+      }
+      function field(parent, title, value = "", type = "text") {
+        const l = el("label", title),
+          i = el(type === "textarea" ? "textarea" : "input");
+        if (type !== "textarea") i.type = type;
+        i.value = value;
+        l.append(i);
+        parent.append(l);
+        return i;
+      }
+      function check(parent, title) {
+        const l = el("label", null, "check"),
+          i = el("input");
+        i.type = "checkbox";
+        l.append(i, el("span", title));
+        parent.append(l);
+        return i;
+      }
+      function select(parent, title, options, value) {
+        const l = el("label", title),
+          i = el("select");
+        for (const [v, t] of options) {
+          const o = el("option", t);
+          o.value = v;
+          i.append(o);
+        }
+        if (value != null) i.value = value;
+        l.append(i);
+        parent.append(l);
+        return i;
+      }
+      function pre(parent, value) {
+        const e = el("pre", json(value));
+        parent.append(e);
+        return e;
+      }
+      async function call(
+        path,
+        method = "GET",
+        body,
+        raw = false,
+        control = false,
+      ) {
+        const current = epoch;
+        const r = await fetch(
+          control ? "/api" + path : "/api/workspaces/" + ws + path,
+          {
+            method,
+            headers: {
+              ...(method !== "GET" ? { "X-CSRF-Token": csrf } : {}),
+              ...(body
+                ? {
+                    "Content-Type": raw
+                      ? "application/octet-stream"
+                      : "application/json",
+                  }
+                : {}),
+            },
+            body: body ? (raw ? body : JSON.stringify(body)) : undefined,
+          },
+        );
+        const data = await r.json();
+        if (!r.ok) {
+          if (r.status === 401 && csrf) {
+            csrf = "";
+            auth(false);
+          }
+          throw Error(data.message || "请求失败");
+        }
+        if (!control && current !== epoch) throw Error("工作区已切换");
+        return data;
+      }
+      async function auth(setup) {
+        clearTimeout(timer);
+        $("nav").hidden = true;
+        $("workspace").hidden = true;
+        $("logout").hidden = true;
+        main.replaceChildren();
+        const form = el("form", null, "auth");
+        form.append(el("h1", setup ? "初始化 Runtime" : "登录 Runtime"));
+        main.append(form);
+        const username = field(form, "用户名"),
+          name = setup ? field(form, "显示名称") : null,
+          password = field(
+            form,
+            setup ? "管理员密码（至少 12 位）" : "密码",
+            "",
+            "password",
+          );
+        username.autocomplete = "username";
+        password.autocomplete = setup ? "new-password" : "current-password";
+        form.append(
+          button(
+            setup ? "创建管理员" : "登录",
+            async () => {
+              const data = await call(
+                "/auth/" + (setup ? "setup" : "login"),
+                "POST",
+                {
+                  username: username.value,
+                  password: password.value,
+                  ...(setup ? { display_name: name.value } : {}),
+                },
+                false,
+                true,
+              );
+              csrf = data.csrf_token;
+              await enter();
+            },
+            "primary",
+          ),
+        );
+        form.onsubmit = (e) => e.preventDefault();
+      }
+      async function enter() {
+        const data = await call("/auth/me", "GET", null, false, true);
+        csrf = data.csrf_token;
+        if (data.user.must_change_password) {
+          main.replaceChildren();
+          const f = el("section", null, "auth");
+          f.append(el("h1", "修改临时密码"));
+          const old = field(f, "当前密码", "", "password"),
+            next = field(f, "新密码（至少 12 位）", "", "password");
+          f.append(
+            button(
+              "保存并重新登录",
+              async () => {
+                await call(
+                  "/auth/password",
+                  "POST",
+                  { current_password: old.value, new_password: next.value },
+                  false,
+                  true,
+                );
+                csrf = "";
+                auth(false);
+              },
+              "primary",
+            ),
+          );
+          main.append(f);
+          return;
+        }
+        const spaces = await call("/workspaces", "GET", null, false, true);
+        const menu = $("workspace");
+        menu.replaceChildren();
+        for (const s of spaces) {
+          const o = el("option", s.name + (s.archived_at ? "（已归档）" : ""));
+          o.value = s.id;
+          menu.append(o);
+        }
+        ws = spaces.some((s) => s.id === ws)
+          ? ws
+          : data.user.preferences.default_workspace_id || spaces[0].id;
+        menu.value = ws;
+        menu.hidden = false;
+        $("logout").hidden = false;
+        menu.onchange = async () => {
+          epoch++;
+          ws = menu.value;
+          selection = null;
+          await load();
+        };
+        $("logout").onclick = async () => {
+          await call("/auth/logout", "POST", null, false, true);
+          csrf = "";
+          auth(false);
+        };
+        $("nav").hidden = false;
+        await load();
+      }
+      async function load() {
+        clearTimeout(timer);
+        const current = epoch;
+        const values = await Promise.all(
+          [
+            "/runtime/packages",
+            "/runtime/deployments",
+            "/runtime/runs",
+            "/model-profiles",
+            "/connections",
+          ].map((p) => call(p)),
+        );
+        if (current !== epoch) return;
+        [
+          state.packages,
+          state.deployments,
+          state.runs,
+          state.models,
+          state.connections,
+        ] = values;
+        render();
+      }
+      function render() {
+        clearTimeout(timer);
+        const query = new URLSearchParams({ workspace: ws, tab });
+        if (selection) query.set("selected", selection);
+        history.replaceState(null, "", "?" + query);
+        $("nav").replaceChildren();
+        for (const [id, title] of [
+          ["packages", "发布包"],
+          ["deployments", "部署"],
+          ["runs", "运行与审计"],
+          ["resources", "模型与连接"],
+        ]) {
+          $("nav").append(
+            button(
+              title,
+              async () => {
+                tab = id;
+                selection = null;
+                await load();
+              },
+              tab === id ? "active" : "",
+            ),
+          );
+        }
+        main.replaceChildren();
+        main.append(
+          el(
+            "h1",
+            {
+              packages: "发布包",
+              deployments: "部署",
+              runs: "运行与审计",
+              resources: "模型与连接",
+            }[tab],
+          ),
+        );
+        if (tab === "resources") {
+          resources();
+          return;
+        }
+        const grid = el("div", null, "split"),
+          list = el("section"),
+          detail = el("section", null, "detail");
+        grid.append(list, detail);
+        main.append(grid);
+        if (tab === "packages") {
+          const input = el("input");
+          input.type = "file";
+          input.accept = ".gz,.zip";
+          input.setAttribute("aria-label", "选择发布包");
+          const actions = el("div", null, "actions");
+          actions.append(
+            input,
+            button(
+              "校验并预览",
+              async () => {
+                if (!input.files[0])
+                  throw Error("请选择 .tar.gz 或 .zip 发布包");
+                const data = await call(
+                  "/runtime/import-jobs",
+                  "POST",
+                  await input.files[0].arrayBuffer(),
+                  true,
+                );
+                preview(detail, data);
+              },
+              "primary",
+            ),
+          );
+          list.append(actions);
+        }
+        const items = state[tab];
+        if (!items.length)
+          list.append(
+            el(
+              "p",
+              {
+                packages: "尚未导入发布包",
+                deployments: "尚未创建部署",
+                runs: "尚无运行记录",
+              }[tab],
+              "empty",
+            ),
+          );
+        for (const item of items) {
+          const row = el("div", null, "row"),
+            info = el("div");
+          info.append(
+            el(
+              "strong",
+              tab === "packages"
+                ? item.manifest.display_name
+                : tab === "deployments"
+                  ? item.name
+                  : item.agent_name,
+            ),
+            el(
+              "small",
+              tab === "packages"
+                ? "v" + item.manifest.package_version
+                : item.id,
+            ),
+          );
+          row.append(
+            info,
+            el("span", status[item.status] || item.status, "tag"),
+            button("查看", async () => {
+              selection = item.id;
+              render();
+            }),
+          );
+          list.append(row);
+        }
+        const item = items.find((i) => i.id === selection);
+        if (!item) {
+          detail.append(el("p", "选择一条记录查看详情", "empty"));
+          return;
+        }
+        if (tab === "packages") packageDetail(detail, item);
+        else if (tab === "deployments") deploymentDetail(detail, item);
+        else runDetail(detail, item.id).catch((e) => show(e.message, true));
+      }
+      function preview(parent, job) {
+        parent.replaceChildren();
+        parent.append(
+          el("h2", "导入预览"),
+          el(
+            "h3",
+            job.manifest.display_name + " · v" + job.manifest.package_version,
+          ),
+        );
+        pre(parent, {
+          package_digest: job.manifest.package_digest,
+          definition_digest: job.manifest.definition_digest,
+          resources: job.resources,
+        });
+        const trusted = check(parent, "我已核对发布者，信任此未签名发布包");
+        parent.append(
+          button(
+            "确认导入",
+            async () => {
+              if (!trusted.checked) throw Error("请先确认发布者信任");
+              const p = await call(
+                "/runtime/import-jobs/" + job.id + "/commit",
+                "POST",
+                { trust_unsigned: true },
+              );
+              selection = p.id;
+              await load();
+              show("发布包已导入，等待目标资源绑定");
+            },
+            "primary",
+          ),
+        );
+      }
+      function packageDetail(parent, item) {
+        parent.append(
+          el("h2", item.manifest.display_name),
+          el("small", item.manifest.package_digest, "muted"),
+          el("h3", "目标资源映射"),
+        );
+        const mappings = { models: {}, connections: {} };
+        for (const [group, title, targets] of [
+          ["models", "模型", state.models],
+          ["connections", "HTTP 连接", state.connections],
+        ])
+          for (const source of item.resources[group]) {
+            const input = select(parent, title + " · " + source.ref, [
+              ["", "请选择目标资源"],
+              ...targets.map((t) => [t.ref, t.name + " · " + t.ref]),
+            ]);
+            mappings[group][source.ref] = input;
+            const d = el("details");
+            d.append(el("summary", "源资源合同"));
+            pre(d, source);
+            parent.append(d);
+          }
+        const allow = check(parent, "允许模型或推理参数替换（仍需重新试运行）"),
+          authorize = check(parent, "授权此部署使用所选目标资源及其凭据");
+        const name = field(parent, "部署名称", item.manifest.display_name);
+        parent.append(
+          button(
+            "保存绑定并创建部署",
+            async () => {
+              const map = { models: {}, connections: {} };
+              for (const g of ["models", "connections"])
+                for (const [ref, input] of Object.entries(mappings[g])) {
+                  if (!input.value) throw Error("请选择全部目标资源");
+                  map[g][ref] = input.value;
+                }
+              const b = await call("/runtime/bindings", "POST", {
+                package_key: item.id,
+                mappings: map,
+                authorize_credentials: authorize.checked,
+                allow_model_substitution: allow.checked,
+              });
+              const d = await call("/runtime/deployments", "POST", {
+                binding_id: b.id,
+                name: name.value,
+              });
+              tab = "deployments";
+              selection = d.id;
+              await load();
+              show("已创建，完成试运行后可启用");
+            },
+            "primary",
+          ),
+        );
+      }
+      function deploymentDetail(parent, item) {
+        parent.append(el("h2", item.name));
+        pre(parent, {
+          status: item.status,
+          binding_id: item.binding_id,
+          package_key: item.package_key,
+          revision: item.revision,
+        });
+        const input = field(
+            parent,
+            "运行输入 JSON",
+            json({ customer_id: "CUST-1001" }),
+            "textarea",
+          ),
+          actions = el("div", null, "actions");
+        for (const [text, path] of [
+          ["试运行", "test-runs"],
+          ["运行", "runs"],
+        ]) {
+          const b = button(
+            text,
+            async () => {
+              const r = await call(
+                "/runtime/deployments/" + item.id + "/" + path,
+                "POST",
+                {
+                  inputs: JSON.parse(input.value),
+                  idempotency_key: crypto.randomUUID(),
+                },
+              );
+              tab = "runs";
+              selection = r.id;
+              await load();
+            },
+            path === "test-runs" ? "primary" : "",
+          );
+          b.disabled =
+            item.status === "REVOKED" ||
+            (path === "runs" && item.status !== "ACTIVE");
+          actions.append(b);
+        }
+        parent.append(actions);
+        const management = el("div", null, "actions");
+        for (const [text, path] of [
+          ["启用", "activate"],
+          ["停用", "disable"],
+          ["撤销", "revoke"],
+        ]) {
+          const b = button(
+            text,
+            async () => {
+              if (
+                path === "revoke" &&
+                !confirm("撤销后将停止后续执行边界，且不能重新启用。继续？")
+              )
+                return;
+              await call(
+                "/runtime/deployments/" + item.id + "/" + path,
+                "POST",
+                { revision: item.revision },
+              );
+              await load();
+              show("部署已更新");
+            },
+            path === "revoke" ? "danger" : "",
+          );
+          b.disabled = item.status === "REVOKED";
+          management.append(b);
+        }
+        parent.append(management);
+      }
+      async function runDetail(parent, id) {
+        const current = epoch;
+        const run = await call("/runtime/runs/" + id);
+        if (current !== epoch || tab !== "runs" || selection !== id) return;
+        parent.append(
+          el("h2", status[run.status] || run.status),
+          el("p", run.test_run ? "部署试运行" : "部署运行", "tag"),
+          el(
+            "p",
+            run.model_mode === "demo" ? "离线固定示例" : "在线模型",
+            "tag",
+          ),
+        );
+        const d = el("details");
+        d.append(el("summary", "执行快照"));
+        pre(d, {
+          package_digest: run.package_digest,
+          binding_digest: run.binding_digest,
+          execution_snapshot_digest: run.execution_snapshot_digest,
+          submitted_by: run.submitted_by,
+        });
+        parent.append(d);
+        for (const pending of run.input_requests.filter(
+          (i) => i.status === "PENDING",
+        )) {
+          parent.append(el("h3", "人工确认"));
+          pre(parent, pending);
+          const data = field(
+              parent,
+              "反馈 JSON",
+              json({ feedback: "已核对查询数据与模型摘要" }),
+              "textarea",
+            ),
+            actions = el("div", null, "actions");
+          for (const [title, decision] of [
+            ["确认", "accept"],
+            ["拒绝", "reject"],
+          ])
+            actions.append(
+              button(
+                title,
+                async () => {
+                  await call(
+                    "/runtime/runs/" + id + "/inputs/" + pending.id,
+                    "POST",
+                    {
+                      revision: pending.revision,
+                      decision,
+                      payload: JSON.parse(data.value),
+                      idempotency_key: crypto.randomUUID(),
+                    },
+                  );
+                  await load();
+                },
+                decision === "accept" ? "primary" : "danger",
+              ),
+            );
+          parent.append(actions);
+        }
+        parent.append(el("h3", "执行结果"));
+        pre(parent, run.error || run.result || run.node_results);
+        const evaluation = await call("/runtime/runs/" + id + "/evaluation");
+        const evaluationPanel = el("details");
+        evaluationPanel.append(
+          el(
+            "summary",
+            "评估 · " + (status[evaluation.status] || evaluation.status),
+          ),
+        );
+        pre(evaluationPanel, evaluation);
+        parent.append(evaluationPanel);
+        const events = await call("/runtime/runs/" + id + "/event-log"),
+          logs = el("details");
+        logs.append(el("summary", "运行事件 · " + events.length));
+        pre(logs, events);
+        parent.append(logs);
+        const evidence = await call("/runtime/runs/" + id + "/evidence"),
+          proof = el("details");
+        proof.append(el("summary", "证据 · " + evidence.length));
+        for (const e of evidence) {
+          const item = el("details");
+          item.append(el("summary", "证据 #" + e.number + " · " + e.title));
+          pre(item, e);
+          proof.append(item);
+        }
+        parent.append(proof);
+        if (!["SUCCEEDED", "FAILED", "CANCELLED"].includes(run.status))
+          parent.append(
+            button(
+              "取消运行",
+              async () => {
+                await call("/runtime/runs/" + id + "/cancel", "POST");
+                await load();
+              },
+              "danger",
+            ),
+          );
+        if (
+          run.status !== "AWAITING_INPUT" &&
+          (!["SUCCEEDED", "FAILED", "CANCELLED"].includes(run.status) ||
+            ["PENDING", "RUNNING"].includes(evaluation.status))
+        )
+          timer = setTimeout(async () => {
+            if (tab === "runs" && selection === id && current === epoch)
+              try {
+                await load();
+              } catch (e) {
+                show(e.message, true);
+              }
+          }, 1800);
+        parent.append(button("刷新记录", () => load()));
+      }
+      function resources() {
+        const grid = el("div", null, "split"),
+          models = el("section"),
+          connections = el("section", null, "detail");
+        grid.append(models, connections);
+        main.append(grid);
+        models.append(el("h2", "注册模型档案"));
+        for (const m of state.models) {
+          const row = el("div", null, "row");
+          row.append(
+            el("strong", m.name),
+            el("small", m.ref + " · " + m.config.mode + " · " + m.config.model),
+          );
+          models.append(row);
+        }
+        const name = field(models, "名称", "目标模型"),
+          mode = select(
+            models,
+            "调用模式",
+            [
+              ["openai", "OpenAI 兼容接口"],
+              ["demo", "离线固定示例"],
+            ],
+            "openai",
+          ),
+          url = field(models, "服务地址", "https://api.openai.com/v1"),
+          model = field(models, "模型名称", "gpt-4.1-mini"),
+          key = field(models, "API Key", "", "password"),
+          temperature = field(
+            models,
+            "Temperature（留空使用模型默认值）",
+            "",
+            "number",
+          ),
+          tokens = field(models, "最大输出 Token", "1800", "number"),
+          timeout = field(models, "请求超时（秒）", "60", "number"),
+          required = check(models, "接口要求 API Key");
+        required.checked = true;
+        models.append(
+          button(
+            "保存模型档案",
+            async () => {
+              await call("/model-profiles", "POST", {
+                name: name.value,
+                mode: mode.value,
+                provider: "custom",
+                base_url: url.value,
+                model: model.value,
+                api_key: key.value,
+                requires_api_key: required.checked,
+                max_tokens: Number(tokens.value),
+                temperature:
+                  temperature.value === "" ? null : Number(temperature.value),
+                timeout_seconds: Number(timeout.value),
+              });
+              key.value = "";
+              await load();
+              show("已保存模型档案");
+            },
+            "primary",
+          ),
+        );
+        connections.append(el("h2", "注册 HTTP 连接"));
+        for (const c of state.connections) {
+          const row = el("div", null, "row");
+          row.append(
+            el("strong", c.name),
+            el("small", c.ref + " · " + c.base_url),
+          );
+          connections.append(row);
+        }
+        const options = state.packages.flatMap((p) =>
+          p.resources.connections.map((c) => [
+            p.id + "|" + c.ref,
+            p.manifest.display_name + " · " + c.ref,
+          ]),
+        );
+        if (!options.length) {
+          connections.append(
+            el("p", "导入发布包后可按其操作合同注册目标连接", "empty"),
+          );
+          return;
+        }
+        const source = select(connections, "操作合同", options),
+          cname = field(connections, "连接名称", "目标查询服务"),
+          base = field(connections, "服务地址", "http://127.0.0.1:18765"),
+          auth = select(connections, "认证方式", [
+            ["none", "无需认证"],
+            ["bearer", "Bearer Token"],
+            ["api_key", "API Key 请求头"],
+          ]),
+          token = field(connections, "凭据", "", "password"),
+          header = field(connections, "API Key 请求头", "X-API-Key"),
+          approved = check(
+            connections,
+            "确认目标接口符合源合同，且所有 POST 操作均为只读查询",
+          );
+        connections.append(
+          button(
+            "保存 HTTP 连接",
+            async () => {
+              if (!approved.checked) throw Error("请先确认操作合同及只读性质");
+              const [id, ref] = source.value.split("|"),
+                contract = state.packages
+                  .find((p) => p.id === id)
+                  .resources.connections.find((c) => c.ref === ref);
+              await call("/connections", "POST", {
+                name: cname.value,
+                base_url: base.value,
+                auth_type: auth.value,
+                bearer_token: token.value,
+                api_key_header: header.value,
+                operations: contract.operations,
+              });
+              token.value = "";
+              await load();
+              show("已保存目标连接");
+            },
+            "primary",
+          ),
+        );
+      }
+      try {
+        const s = await call("/auth/status", "GET", null, false, true);
+        if (!s.initialized) auth(true);
+        else {
+          try {
+            await enter();
+          } catch {
+            auth(false);
+          }
+        }
+      } catch (e) {
+        show(e.message, true);
+      }
+    </script>
+  </body>
+</html>

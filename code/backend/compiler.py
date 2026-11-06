@@ -3,6 +3,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from backend.data_policy import validate_business_data
 from backend.registry import FUNCTIONS, skills
 from backend.schemas import BusinessError, Workflow
 
@@ -80,7 +81,7 @@ def validate(workflow: Workflow, resources=None) -> list[dict]:
         validate_v2(workflow, resources, error)
         if errors:
             return errors
-    elif any(n.type in ("http", "human_input") for n in nodes.values()):
+    elif any(n.type in ("http", "human_input", "transform") for n in nodes.values()):
         error("HTTP 和人工反馈节点需要 V2 流程")
     allowed_tools = workflow.policy.get("tools", [])
     if not isinstance(allowed_tools, list) or any(t not in FUNCTIONS for t in allowed_tools):
@@ -165,6 +166,11 @@ def validate(workflow: Workflow, resources=None) -> list[dict]:
     text = dump(workflow.model_dump()).lower()
     if any(secret in text for secret in ('"api_key"', '"password"', '"authorization"', "sk-")):
         error("流程定义中禁止保存凭据")
+    else:
+        try:
+            validate_business_data(workflow.model_dump())
+        except BusinessError:
+            error("流程定义中禁止保存凭据，请使用资源引用")
     return errors
 
 

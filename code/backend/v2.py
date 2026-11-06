@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from backend.schema_validation import check_schema, validate_data
 from backend.schemas import BusinessError
+from backend.transforms import TransformConfig
 
 
 class V2Policy(BaseModel):
@@ -27,7 +28,7 @@ class ModelNodeConfig(BaseModel):
     system_prompt: str = Field(min_length=1, max_length=16000)
     user_prompt_template: str = Field(max_length=16000)
     tools: list[str] = Field(default_factory=list, max_length=20)
-    skills: list[str] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list, max_length=10)
 
 
 class HttpNodeConfig(BaseModel):
@@ -59,6 +60,7 @@ class ConditionNodeConfig(BaseModel):
 
 
 CONFIG_MODELS = {
+    "transform": TransformConfig,
     "llm": ModelNodeConfig,
     "agent": ModelNodeConfig,
     "http": HttpNodeConfig,
@@ -130,13 +132,15 @@ def validate_v2(workflow, resources, error):
         if workflow.input_schema.get("type") != "object" or workflow.output_schema.get("type") != "object":
             raise BusinessError("SCHEMA_INVALID", "首期输入输出 Schema 必须为 object")
         if workflow.state_fields or workflow.child_agent_refs or workflow.skill_refs:
-            raise BusinessError("CAPABILITY_UNAVAILABLE", "V2 首期尚未开放业务 State、Skill 和子图")
+            raise BusinessError(
+                "CAPABILITY_UNAVAILABLE", "V2 Skill 使用 dependency_refs.skills；业务 State 和子图尚未开放"
+            )
         if workflow.evaluation_ref != "generic-result-evaluation@1":
             raise BusinessError("CAPABILITY_UNAVAILABLE", "V2 请使用 generic-result-evaluation@1")
         if set(workflow.dependency_refs) - {"models", "connections", "validators", "tools", "skills", "subgraphs"}:
             raise BusinessError("CAPABILITY_UNAVAILABLE", "依赖分组不可用")
-        if workflow.dependency_refs.get("skills") or workflow.dependency_refs.get("subgraphs"):
-            raise BusinessError("CAPABILITY_UNAVAILABLE", "V2 首期尚未开放 Skill 和子图依赖")
+        if workflow.dependency_refs.get("subgraphs"):
+            raise BusinessError("CAPABILITY_UNAVAILABLE", "V2 尚未开放子图依赖")
         if set(workflow.policy) - {
             "tools",
             "objects",
@@ -163,6 +167,10 @@ def validate_v2(workflow, resources, error):
         bindings = resources.bindings(workflow) if resources else None
         operations = {}
         if bindings:
+            from backend.skill_resources import check_skill
+
+            for skill in bindings.get("skills", {}).values():
+                check_skill(skill)
             for connection in bindings["connections"].values():
                 for op in connection["operations"]:
                     operations.setdefault(op["id"], []).append((connection, op))
@@ -182,11 +190,23 @@ def validate_v2(workflow, resources, error):
                     raise BusinessError("SCHEMA_INVALID", "节点配置字段缺失、类型错误或含未支持选项") from None
             elif node.type in ("input", "output") and node.config:
                 raise BusinessError("SCHEMA_INVALID", "输入输出节点使用工作流 Schema，无额外执行配置")
-            if node.type not in ("input", "http", "llm", "agent", "verify", "human_input", "condition", "output"):
+            if node.type not in (
+                "input",
+                "http",
+                "transform",
+                "llm",
+                "agent",
+                "verify",
+                "human_input",
+                "condition",
+                "output",
+            ):
                 raise BusinessError("CAPABILITY_UNAVAILABLE", "该节点尚未接入 V2 执行器，请继续使用 V1")
             for schema in (node.input_schema, node.output_schema):
                 if schema is not None:
                     check_schema(schema)
+            if node.type == "transform" and (not node.output_schema or node.output_schema.get("type") != "object"):
+                raise BusinessError("SCHEMA_INVALID", "字段转换需要 object 输出 Schema")
             if node.type in ("llm", "agent"):
                 ref = node.config.get("model_ref")
                 if ref not in workflow.dependency_refs.get("models", []):
@@ -202,8 +222,27 @@ def validate_v2(workflow, resources, error):
                 ):
                     raise BusinessError("SCHEMA_INVALID", "请填写节点系统提示词")
                 check_template(node.config.get("user_prompt_template", ""), node.inputs)
-                if node.config.get("skills"):
-                    raise BusinessError("CAPABILITY_UNAVAILABLE", "V2 首期尚未开放 Skill 版本管理")
+                selected_skills = node.config.get("skills", [])
+                if len(set(selected_skills)) != len(selected_skills) or not set(selected_skills).issubset(
+                    workflow.dependency_refs.get("skills", [])
+                ):
+                    raise BusinessError("REFERENCE_INVALID", "节点 Skill 必须绑定已注册的固定版本")
+                if selected_skills and (
+                    node.type != "agent" or node.config.get("executor", "direct_model") == "direct_model"
+                ):
+                    raise BusinessError("CAPABILITY_UNAVAILABLE", "Skill 请使用 LangChain Agent 或 Deep Agent 节点")
+                for skill_ref in selected_skills:
+                    if not bindings:
+                        continue
+                    skill = bindings.get("skills", {}).get(skill_ref)
+                    if not skill:
+                        raise BusinessError("REFERENCE_INVALID", "Skill 版本不存在")
+                    if not set(skill["tools"]).issubset(node.config.get("tools", [])):
+                        raise BusinessError("POLICY_DENIED", "Skill 的软件工具必须显式授权给当前 Agent 节点")
+                    if not set(skill["connection_refs"]).issubset(workflow.dependency_refs.get("connections", [])):
+                        raise BusinessError("REFERENCE_INVALID", "Skill 缺少所需连接版本")
+                    if set(skill["input_schema"].get("required", [])) - set(node.inputs):
+                        raise BusinessError("SCHEMA_INVALID", "Skill 缺少必填输入映射")
                 requested = node.config.get("tools", [])
                 if not isinstance(requested, list) or not set(requested).issubset(capabilities):
                     raise BusinessError("POLICY_DENIED", "Agent 工具必须属于工作流授权能力")
@@ -222,7 +261,7 @@ def validate_v2(workflow, resources, error):
                 if bindings:
                     op = next((o for o in bindings["connections"][ref]["operations"] if o["id"] == cap), None)
                     if not op or op["effect"] != "read_only":
-                        raise BusinessError("POLICY_DENIED", "首期仅支持已注册只读 GET 操作")
+                        raise BusinessError("POLICY_DENIED", "仅支持已注册只读 HTTP 操作")
                     if set(op["input_schema"].get("required", [])) - set(node.inputs):
                         raise BusinessError("SCHEMA_INVALID", "HTTP 操作缺少必填参数映射")
             if node.type == "verify":

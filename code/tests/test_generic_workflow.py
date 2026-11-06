@@ -46,6 +46,14 @@ def service(monkeypatch):
                 self.send_json({"error": {"message": "private-provider-detail"}}, 401)
                 return
             if body.get("tools") and not any(m["role"] == "tool" for m in body["messages"]):
+                selected = next(
+                    (
+                        t
+                        for t in body["tools"]
+                        if "customer_id" in t["function"].get("parameters", {}).get("properties", {})
+                    ),
+                    body["tools"][0],
+                )
                 self.send_json(
                     {
                         "id": "chatcmpl-tool",
@@ -63,7 +71,7 @@ def service(monkeypatch):
                                             "id": "call-orders",
                                             "type": "function",
                                             "function": {
-                                                "name": body["tools"][0]["function"]["name"],
+                                                "name": selected["function"]["name"],
                                                 "arguments": json.dumps({"customer_id": "CUST-1001"}),
                                             },
                                         }
@@ -364,7 +372,7 @@ def test_agent_http_tool_uses_the_same_gateway(client, service):
 
 def test_http_connection_versions_and_secrets_are_not_embedded(client, service):
     _, url = service
-    connection = client.get("/api/connections").json()[0]
+    connection = next(c for c in client.get("/api/connections").json() if c["id"] == "conn_orders")
     body = {key: connection[key] for key in ("name", "revision", "base_url", "timeout_seconds", "operations")}
     body["bearer_token"] = "http-private-fixture-token"
     saved = client.put(f"/api/connections/{connection['id']}", json=body)

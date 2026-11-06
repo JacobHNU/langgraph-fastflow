@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './fixtures';
 
 test('record a completed order workflow from the configured live model', async ({ page }) => {
   test.skip(

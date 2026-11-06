@@ -55,6 +55,8 @@ export type AuditEvent = {
   evidence_refs: string[];
 };
 export type Run = {
+  entrypoint?: string;
+  debug_node_id?: string;
   id: string;
   agent_id: string;
   agent_name: string;
@@ -84,14 +86,78 @@ export type Registry = {
   skills: { id: string; name: string; content: string; sha256: string; tools: string[] }[];
 };
 
-export async function api<T = any>(path: string, method = 'GET', body?: unknown): Promise<T> {
-  const response = await fetch('/api' + path, {
+let apiState = { workspace: '', user: '', csrf: '', generation: 0 };
+
+export function configureApi(workspace: string, user: string, csrf: string) {
+  const generation =
+    apiState.generation + Number(workspace !== apiState.workspace || user !== apiState.user);
+  apiState = { workspace, user, csrf, generation };
+  document.documentElement.dataset.user = user;
+}
+
+export function workspaceApiPath(path: string) {
+  return `/api/workspaces/${apiState.workspace}${path}`;
+}
+
+export function storageScope() {
+  return `${apiState.user}:${apiState.workspace}`;
+}
+export function userScope() {
+  return apiState.user;
+}
+export function locationFor(query = '') {
+  const params = new URLSearchParams(query.replace(/^\?/, ''));
+  if (apiState.workspace) params.set('workspace', apiState.workspace);
+  return location.pathname + (params.size ? `?${params}` : '');
+}
+
+async function request<T>(
+  url: string,
+  method: string,
+  body: unknown,
+  generation?: number,
+): Promise<T> {
+  const response = await fetch(url, {
     method,
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    credentials: 'same-origin',
+    headers: {
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+      ...(apiState.csrf ? { 'X-CSRF-Token': apiState.csrf } : {}),
+    },
     body: body ? JSON.stringify(body) : undefined,
   });
   const result = await response.json();
-  if (!response.ok) throw new Error(result.message || result.detail || '请求失败');
+  if (generation !== undefined && generation !== apiState.generation)
+    throw new Error('工作区已切换');
+  if (response.status === 401 && !url.endsWith('/auth/login'))
+    window.dispatchEvent(new Event('session-expired'));
+  if (!response.ok) {
+    const detail = result.message || result.detail;
+    const message =
+      typeof detail === 'string'
+        ? detail
+        : detail
+          ? `${detail.reason || '请求失败'}${detail.runs ? '：' + detail.runs.map((r: any) => r.run_id).join('、') : ''}${detail.workspaces ? '：' + detail.workspaces.map((w: any) => `${w.workspace_id} (${w.count})`).join('、') : ''}`
+          : '请求失败';
+    throw Object.assign(
+      new Error(
+        message +
+          (result.errors?.length ? '：' + result.errors.map((e: any) => e.message).join('；') : ''),
+      ),
+      { status: response.status },
+    );
+  }
+  return result;
+}
+
+export function systemApi<T = any>(path: string, method = 'GET', body?: unknown): Promise<T> {
+  return request<T>('/api' + path, method, body);
+}
+
+export async function api<T = any>(path: string, method = 'GET', body?: unknown): Promise<T> {
+  const generation = apiState.generation;
+  const result = await request<T>(workspaceApiPath(path), method, body, generation);
+  if (generation !== apiState.generation) throw new Error('工作区已切换');
   return result;
 }
 export const pretty = (data: unknown) => JSON.stringify(data, null, 2);
@@ -108,6 +174,7 @@ export const labels: Record<string, string> = {
   managed_agent: '固定子 Agent',
   subworkflow: '固定子流程',
   http: 'HTTP 查询',
+  transform: '字段转换',
   human_input: '人工确认',
 };
 export const statuses: Record<string, string> = {
@@ -123,4 +190,5 @@ export const statuses: Record<string, string> = {
   PASSED: '评估通过',
   FLAGGED: '需关注',
   UNAVAILABLE: '评估不可用',
+  SKIPPED: '节点试跑不评估',
 };

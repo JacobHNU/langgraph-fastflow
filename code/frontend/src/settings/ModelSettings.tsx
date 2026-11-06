@@ -11,6 +11,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import { api } from '../types';
+import { useSettingsDraft, useSystem } from '../system/SystemContext';
 
 type ModelConfig = {
   mode: 'demo' | 'openai' | 'unavailable';
@@ -45,9 +46,11 @@ const providers = [
 ];
 
 export function ModelSettings({ onSaved }: { onSaved: () => void }) {
+  const archived = !!useSystem().workspace.archived_at;
   const [config, setConfig] = useState<ModelConfig | null>(null);
   const [key, setKey] = useState('');
   const [clearKey, setClearKey] = useState(false);
+  const [savedScope, setSavedScope] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [busy, setBusy] = useState('');
   const [models, setModels] = useState<string[]>([]);
@@ -57,6 +60,7 @@ export function ModelSettings({ onSaved }: { onSaved: () => void }) {
   const load = async () => {
     const value = await api<ModelConfig>('/settings/model');
     setConfig(value);
+    setSavedScope(`${value.provider}|${value.base_url}`);
     setKey('');
     setClearKey(false);
     setShowKey(false);
@@ -75,7 +79,11 @@ export function ModelSettings({ onSaved }: { onSaved: () => void }) {
   const payload = () => {
     if (!config) throw new Error('模型设置尚未加载');
     const { api_key_configured: _key, source: _source, updated_at: _updated, ...values } = config;
-    return { ...values, api_key: key || null, clear_api_key: clearKey };
+    return {
+      ...values,
+      api_key: key || null,
+      api_key_action: clearKey ? 'clear' : key ? 'replace' : 'preserve',
+    };
   };
   const act = async (action: 'save' | 'test' | 'models') => {
     setBusy(action);
@@ -84,6 +92,7 @@ export function ModelSettings({ onSaved }: { onSaved: () => void }) {
       if (action === 'save') {
         const value = await api<ModelConfig>('/settings/model', 'PUT', payload());
         setConfig(value);
+        setSavedScope(`${value.provider}|${value.base_url}`);
         setKey('');
         setClearKey(false);
         setShowKey(false);
@@ -108,14 +117,23 @@ export function ModelSettings({ onSaved }: { onSaved: () => void }) {
           error: false,
         });
       }
+      return true;
     } catch (e) {
       const result = { text: e instanceof Error ? e.message : '请求失败', error: true };
       if (action === 'test') setTestResult(result);
       else setFeedback(result);
+      return false;
     } finally {
       setBusy('');
     }
   };
+  useSettingsDraft(
+    dirty,
+    () => act('save'),
+    () => {
+      void load();
+    },
+  );
   if (!config)
     return (
       <div className="settings-section" role="status">
@@ -123,6 +141,7 @@ export function ModelSettings({ onSaved }: { onSaved: () => void }) {
       </div>
     );
   const online = config.mode === 'openai';
+  const sameScope = savedScope === `${config.provider}|${config.base_url.replace(/\/+$/, '')}`;
   return (
     <section className="settings-section model-settings" aria-labelledby="model-settings-title">
       <div className="settings-title-row">
@@ -140,7 +159,7 @@ export function ModelSettings({ onSaved }: { onSaved: () => void }) {
           void act('save');
         }}
       >
-        <fieldset disabled={!!busy}>
+        <fieldset disabled={!!busy || archived}>
           <div className="field">
             <label htmlFor="model-mode">运行模式</label>
             <select
@@ -169,7 +188,7 @@ export function ModelSettings({ onSaved }: { onSaved: () => void }) {
                   setModels([]);
                   if (config.provider !== selected.id) {
                     setKey('');
-                    setClearKey(true);
+                    setClearKey(false);
                   }
                 }}
               >
@@ -233,7 +252,15 @@ export function ModelSettings({ onSaved }: { onSaved: () => void }) {
             <div className="settings-label-row">
               <label htmlFor="model-api-key">API Key</label>
               <span className="key-status">
-                {clearKey ? '待清除' : config.api_key_configured ? '已配置' : '未配置'}
+                {clearKey
+                  ? '待清除当前服务密钥'
+                  : key
+                    ? '待替换'
+                    : !sameScope
+                      ? '按服务商与地址保留'
+                      : config.api_key_configured
+                        ? '已配置'
+                        : '未配置'}
               </span>
             </div>
             <div className="settings-input-action">
@@ -241,9 +268,7 @@ export function ModelSettings({ onSaved }: { onSaved: () => void }) {
                 id="model-api-key"
                 type={showKey ? 'text' : 'password'}
                 value={key}
-                placeholder={
-                  config.api_key_configured && !clearKey ? '已保存，留空保留原密钥' : '输入 API Key'
-                }
+                placeholder={!clearKey ? '留空保留当前服务已存密钥' : '输入 API Key'}
                 maxLength={4096}
                 autoComplete="new-password"
                 spellCheck={false}
@@ -267,7 +292,7 @@ export function ModelSettings({ onSaved }: { onSaved: () => void }) {
                 className="icon-button"
                 type="button"
                 title="清除密钥"
-                disabled={!key && !config.api_key_configured}
+                disabled={clearKey || (!key && sameScope && !config.api_key_configured)}
                 onClick={() => {
                   setKey('');
                   setClearKey(true);
@@ -278,6 +303,25 @@ export function ModelSettings({ onSaved }: { onSaved: () => void }) {
                 <Trash2 size={16} />
               </button>
             </div>
+            <small>
+              密钥按服务商和 Base URL 隔离保存，切换不会删除原密钥，也不会将原密钥发送到新地址。
+              测试连接不会保存修改。
+            </small>
+            {(clearKey || key) && (
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => {
+                  setKey('');
+                  setClearKey(false);
+                  setDirty(true);
+                  setTestResult(null);
+                  setFeedback(null);
+                }}
+              >
+                保留已存密钥
+              </button>
+            )}
           </div>
           <label className="checkbox-line model-key-option">
             <input

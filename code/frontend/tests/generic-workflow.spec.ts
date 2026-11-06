@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page } from './fixtures';
 
 test('run waits until the selected published version has loaded', async ({ page }) => {
   let unblock!: () => void;
@@ -9,7 +9,7 @@ test('run waits until the selected published version has loaded', async ({ page 
   const received = new Promise<void>((resolve) => {
     requested = resolve;
   });
-  await page.route('**/api/agents/customer-order-summary/versions', async (route) => {
+  await page.route('**/api/workspaces/*/agents/customer-order-summary/versions', async (route) => {
     const response = await route.fetch();
     requested();
     await blocked;
@@ -94,7 +94,10 @@ test('six-node V2 workflow edits, publishes, pauses, reloads and resumes once', 
   expect(before.usage.tool_calls).toBe(1);
   await page.reload();
   await expect(page.locator('.human-confirmation')).toBeVisible();
-  await page.getByLabel('反馈').fill('已核对订单，确认摘要');
+  await page
+    .locator('.human-confirmation')
+    .getByLabel('反馈', { exact: true })
+    .fill('已核对订单，确认摘要');
   await page.getByRole('button', { name: '确认并继续', exact: true }).click();
   await expect(page.locator('.result-overview')).toContainText('执行成功', { timeout: 20000 });
   await expect(page.locator('.analysis-result')).toContainText('CUST-1001');

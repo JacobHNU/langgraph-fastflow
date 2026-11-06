@@ -3,6 +3,12 @@ import { Check, Plus, Trash2, X } from 'lucide-react';
 import { type NodeSpec, type Registry, type Workflow, api, labels, pretty } from '../types';
 import { ObjectSchemaEditor, SchemaEditor } from '../SchemaForm';
 import { NodeIcon } from './WorkflowEditor';
+import { TransformEditor } from './TransformEditor';
+import { NodeDebug } from './NodeDebug';
+import { authoringSnapshot, resourceVersions, schemaFields, upstreamNodes } from './authoring';
+import { ResourceManager } from '../settings/WorkspaceSettings';
+import { SkillManager } from '../settings/SkillManager';
+import { ResourceBrowser, resourceMatches, type ResourceChoice } from '../settings/ResourceBrowser';
 
 function parseValue(text: string) {
   try {
@@ -21,6 +27,7 @@ export function Inspector({
   onClose,
   readonly,
   result,
+  debug,
 }: {
   node: NodeSpec;
   workflow: Workflow;
@@ -30,27 +37,111 @@ export function Inspector({
   onClose: () => void;
   readonly: boolean;
   result?: any;
+  debug?: { agentId: string; revision: number; layout: any };
 }) {
   const [draft, setDraft] = useState<NodeSpec>(structuredClone(node));
   const [inputSchema, setInputSchema] = useState(workflow.input_schema);
   const [outputSchema, setOutputSchema] = useState(workflow.output_schema);
   const [profiles, setProfiles] = useState<any[]>([]);
   const [connections, setConnections] = useState<any[]>([]);
+  const [skills, setSkills] = useState<any[]>([]);
   const [loadError, setLoadError] = useState('');
+  const [catalog, setCatalog] = useState<'connections' | 'skills' | null>(null);
+  const [skillQuery, setSkillQuery] = useState('');
+  const [toolQuery, setToolQuery] = useState('');
   const v2 = workflow.schema_version === '2.0';
+  const loadResources = async (extraConnection?: string) => {
+    const skillRefs = [...(workflow.dependency_refs?.skills || []), ...(draft.config.skills || [])];
+    const s = await resourceVersions('/skills', skillRefs);
+    const refs = [
+      ...(workflow.dependency_refs?.connections || []),
+      draft.config.connection_ref,
+      extraConnection,
+      ...s.filter((v) => skillRefs.includes(v.ref)).flatMap((v) => v.connection_refs),
+    ].filter(Boolean);
+    const [p, c] = await Promise.all([
+      api<any[]>('/model-profiles'),
+      resourceVersions('/connections', refs),
+    ]);
+    return { p, c, s };
+  };
+  const refreshResources = async (extraConnection?: string) => {
+    const { p, c, s } = await loadResources(extraConnection);
+    setProfiles(p);
+    setConnections(c);
+    setSkills(s);
+    setLoadError('');
+  };
   useEffect(() => {
     if (!v2) return;
-    Promise.all([api<any[]>('/model-profiles'), api<any[]>('/connections')])
-      .then(([p, c]) => {
-        setProfiles(p);
-        setConnections(c);
+    let disposed = false;
+    loadResources()
+      .then(({ p, c, s }) => {
+        if (!disposed) {
+          setProfiles(p);
+          setConnections(c);
+          setSkills(s);
+        }
       })
-      .catch((e) => setLoadError(e.message));
+      .catch((e) => {
+        if (!disposed) setLoadError(e.message);
+      });
+    return () => {
+      disposed = true;
+    };
   }, [v2]);
   const config = (key: string, value: unknown) =>
     setDraft({ ...draft, config: { ...draft.config, [key]: value } });
   const setInput = (key: string, value: unknown) =>
     setDraft({ ...draft, inputs: { ...draft.inputs, [key]: value } });
+  const chooseResource = async ({ resource, operation }: ResourceChoice) => {
+    if (catalog === 'connections') {
+      if (!operation) throw new Error('请选择已注册的接口操作');
+      setConnections((old) => [...old.filter((c) => c.ref !== resource.ref), resource]);
+      setDraft((old) => ({
+        ...old,
+        config: { ...old.config, connection_ref: resource.ref, operation_ref: operation.id },
+        output_schema: operation.response_schema,
+        inputs: Object.fromEntries(
+          Object.keys(operation.input_schema.properties || {}).map((key) => [
+            key,
+            old.inputs[key] || { source: 'input', path: [key] },
+          ]),
+        ),
+      }));
+    } else {
+      const pinned = await resourceVersions('/connections', [
+        ...(workflow.dependency_refs?.connections || []),
+        ...resource.connection_refs,
+      ]);
+      setConnections((old) => [...new Map([...old, ...pinned].map((c) => [c.ref, c])).values()]);
+      setSkills((old) => [...old.filter((s) => s.ref !== resource.ref), resource]);
+      setDraft((old) => ({
+        ...old,
+        config: {
+          ...old.config,
+          executor:
+            old.config.executor === 'direct_model' || !old.config.executor
+              ? 'langchain_agent'
+              : old.config.executor,
+          skills: [
+            ...(old.config.skills || []).filter((ref: string) => ref.split('@')[0] !== resource.id),
+            resource.ref,
+          ],
+          tools: [...new Set([...(old.config.tools || []), ...resource.tools])],
+        },
+        inputs: {
+          ...Object.fromEntries(
+            Object.keys(resource.input_schema.properties || {}).map((key) => [
+              key,
+              { source: 'input', path: [key] },
+            ]),
+          ),
+          ...old.inputs,
+        },
+      }));
+    }
+  };
   return (
     <div className="inspector">
       <div className="panel-heading">
@@ -78,6 +169,39 @@ export function Inspector({
         </div>
         <fieldset disabled={readonly}>
           {loadError && <p role="alert">{loadError}</p>}
+          {v2 && ['http', 'agent'].includes(node.type) && (
+            <details>
+              <summary>添加 / 编辑软件工具{node.type === 'agent' ? '与 Skill' : ''}</summary>
+              <p className="muted">资源保存为新版本；选择后点击“应用修改”才更新画布。</p>
+              <ResourceManager
+                kind="connections"
+                onSaved={(value) => {
+                  void refreshResources(value.ref).catch((e) => setLoadError(e.message));
+                  if (node.type === 'http') {
+                    const op = value.operations[0];
+                    setDraft((old) => ({
+                      ...old,
+                      config: { ...old.config, connection_ref: value.ref, operation_ref: op.id },
+                      output_schema: op.response_schema,
+                      inputs: Object.fromEntries(
+                        Object.keys(op.input_schema.properties || {}).map((key) => [
+                          key,
+                          old.inputs[key] || { source: 'input', path: [key] },
+                        ]),
+                      ),
+                    }));
+                  }
+                }}
+              />
+              {node.type === 'agent' && (
+                <SkillManager
+                  onSaved={() => {
+                    void refreshResources().catch((e) => setLoadError(e.message));
+                  }}
+                />
+              )}
+            </details>
+          )}
           {v2 && node.type === 'input' && (
             <ObjectSchemaEditor label="入口字段" value={inputSchema} onChange={setInputSchema} />
           )}
@@ -86,8 +210,29 @@ export function Inspector({
           )}
           {v2 && node.type === 'http' && (
             <>
+              {connections
+                .filter((c) => c.ref === draft.config.connection_ref)
+                .map((c) => {
+                  const op = c.operations.find((o: any) => o.id === draft.config.operation_ref);
+                  return op ? (
+                    <p className="small-code" key={c.ref}>
+                      {op.method} {c.base_url}
+                      {op.path}
+                      <br />
+                      {c.auth_type === 'none'
+                        ? '无需鉴权'
+                        : c.credential_configured
+                          ? '已绑定连接凭据'
+                          : '连接尚未配置凭据'}{' '}
+                      · {c.timeout_seconds}s · 只读工具
+                    </p>
+                  ) : null;
+                })}
               <div className="field">
                 <label>HTTP 连接版本</label>
+                <button className="secondary" onClick={() => setCatalog('connections')}>
+                  搜索与预览 HTTP 工具版本
+                </button>
                 <select
                   aria-label="HTTP 连接版本"
                   value={draft.config.connection_ref || ''}
@@ -162,6 +307,19 @@ export function Inspector({
                     ))}
                 </select>
               </div>
+            </>
+          )}
+          {v2 && node.type === 'transform' && (
+            <>
+              <TransformEditor
+                value={draft.config}
+                onChange={(value) => setDraft({ ...draft, config: value })}
+              />
+              <SchemaEditor
+                label="转换输出 Schema"
+                value={draft.output_schema}
+                onChange={(value) => setDraft({ ...draft, output_schema: value })}
+              />
             </>
           )}
           {v2 && node.type === 'verify' && (
@@ -307,9 +465,99 @@ export function Inspector({
                   />
                   {node.type === 'agent' && (
                     <div className="field">
+                      <label>绑定 Skill 版本</label>
+                      <button className="secondary" onClick={() => setCatalog('skills')}>
+                        搜索与预览 Skill 版本
+                      </button>
+                      <p className="muted">
+                        选择即授权所列软件工具，并绑定所列连接版本。输入在下方映射；使用 LangChain
+                        Agent 或 Deep Agent 执行。
+                      </p>
+                      <input
+                        aria-label="搜索节点 Skill"
+                        placeholder="搜索名称或所需工具，已绑定版本始终显示"
+                        value={skillQuery}
+                        onChange={(e) => setSkillQuery(e.target.value)}
+                      />
+                      {!skills.length && <p>从上方“添加 / 编辑软件工具与 Skill”新建 Skill。</p>}
+                      {skills
+                        .filter(
+                          (s) =>
+                            resourceMatches(s, skillQuery) ||
+                            (draft.config.skills || []).includes(s.ref),
+                        )
+                        .map((s) => (
+                          <label className="checkbox-row" key={s.ref}>
+                            <input
+                              type="checkbox"
+                              aria-label={`选择 Skill ${s.ref}`}
+                              checked={(draft.config.skills || []).includes(s.ref)}
+                              onChange={(e) =>
+                                setDraft((old) => ({
+                                  ...old,
+                                  config: {
+                                    ...old.config,
+                                    executor:
+                                      old.config.executor === 'direct_model' || !old.config.executor
+                                        ? 'langchain_agent'
+                                        : old.config.executor,
+                                    skills: e.target.checked
+                                      ? [
+                                          ...(old.config.skills || []).filter(
+                                            (ref: string) => ref.split('@')[0] !== s.id,
+                                          ),
+                                          s.ref,
+                                        ]
+                                      : (old.config.skills || []).filter(
+                                          (ref: string) => ref !== s.ref,
+                                        ),
+                                    tools: e.target.checked
+                                      ? [...new Set([...(old.config.tools || []), ...s.tools])]
+                                      : old.config.tools,
+                                  },
+                                  inputs: e.target.checked
+                                    ? {
+                                        ...Object.fromEntries(
+                                          Object.keys(s.input_schema.properties || {}).map(
+                                            (key) => [key, { source: 'input', path: [key] }],
+                                          ),
+                                        ),
+                                        ...old.inputs,
+                                      }
+                                    : old.inputs,
+                                }))
+                              }
+                            />
+                            {s.name} · {s.ref} · 授权 {s.tools.join(', ') || '无工具'}
+                          </label>
+                        ))}
+                      <p className="muted">
+                        新版本需明确采用，不会自动升级。移除或替换 Skill
+                        后，原工具授权保留，可在下方逐项取消。
+                      </p>
+                    </div>
+                  )}
+                  {node.type === 'agent' && (
+                    <div className="field">
                       <label>授权 HTTP 工具</label>
+                      <input
+                        aria-label="搜索节点工具"
+                        placeholder="搜索名称、工具编号或路径"
+                        value={toolQuery}
+                        onChange={(e) => setToolQuery(e.target.value)}
+                      />
                       {connections
                         .flatMap((c) => c.operations)
+                        .filter(
+                          (op, index, all) => all.findIndex((item) => item.id === op.id) === index,
+                        )
+                        .filter(
+                          (op) =>
+                            resourceMatches(
+                              { name: op.name, ref: op.id, operations: [op] },
+                              toolQuery,
+                            ) || (draft.config.tools || []).includes(op.id),
+                        )
                         .map((op) => (
                           <label className="checkbox-row" key={op.id}>
                             <input
@@ -442,6 +690,29 @@ export function Inspector({
           {Object.entries(draft.inputs).map(([key, raw]) => {
             const value = raw as any;
             const source = value?.source || 'constant';
+            const upstream = upstreamNodes(workflow, node.id);
+            const sourceNode = workflow.nodes.find((n) => n.id === value?.node_id);
+            const sourceSchema =
+              source === 'input' || sourceNode?.type === 'input'
+                ? inputSchema
+                : sourceNode?.type === 'http'
+                  ? connections
+                      .find((c) => c.ref === sourceNode.config.connection_ref)
+                      ?.operations.find((op: any) => op.id === sourceNode.config.operation_ref)
+                      ?.response_schema
+                  : sourceNode?.output_schema;
+            const operation =
+              node.type === 'http'
+                ? connections
+                    .find((c) => c.ref === draft.config.connection_ref)
+                    ?.operations.find((op: any) => op.id === draft.config.operation_ref)
+                : undefined;
+            const field =
+              operation?.input_schema?.properties?.[key] ||
+              skills
+                .filter((s) => (draft.config.skills || []).includes(s.ref))
+                .map((s) => s.input_schema.properties?.[key])
+                .find(Boolean);
             return (
               <div className="mapping" key={key}>
                 <div className="mapping-heading">
@@ -486,6 +757,14 @@ export function Inspector({
                     </button>
                   )}
                 </div>
+                {field && (
+                  <p className="muted">
+                    {field.type || '任意'}
+                    {operation
+                      ? ` · ${operation.input_schema.required?.includes(key) ? '必填' : '可选'} · ${operation.parameters?.[key]?.location || 'path'}`
+                      : ' · Skill 输入'}
+                  </p>
+                )}
                 <select
                   aria-label={`${key} 来源`}
                   value={source === 'node' ? value.node_id : source}
@@ -507,9 +786,32 @@ export function Inspector({
                     .map((n) => (
                       <option value={n.id} key={n.id}>
                         {n.title} · {n.id}
+                        {v2 && !upstream.some((u) => u.id === n.id) ? '（连线待校验）' : ''}
                       </option>
                     ))}
                 </select>
+                {v2 && source !== 'constant' && (
+                  <select
+                    aria-label={`${key} 上游字段`}
+                    value=""
+                    onChange={(e) => {
+                      if (e.target.value)
+                        setInput(key, { ...value, path: JSON.parse(e.target.value) });
+                    }}
+                  >
+                    <option value="">选择上游字段（或在下方填写路径）</option>
+                    <option value="[]">整个输出对象</option>
+                    {schemaFields(
+                      source === 'input' || upstream.some((u) => u.id === value.node_id)
+                        ? sourceSchema
+                        : undefined,
+                    ).map((f) => (
+                      <option key={JSON.stringify(f.path)} value={JSON.stringify(f.path)}>
+                        {f.label}
+                      </option>
+                    ))}
+                  </select>
+                )}
                 {source === 'constant' ? (
                   <input
                     aria-label={`${key} 常量值`}
@@ -519,7 +821,11 @@ export function Inspector({
                         : JSON.stringify(value?.value ?? raw)
                     }
                     onBlur={(e) =>
-                      setInput(key, { source: 'constant', value: parseValue(e.target.value) })
+                      setInput(key, {
+                        source: 'constant',
+                        value:
+                          field?.type === 'string' ? e.target.value : parseValue(e.target.value),
+                      })
                     }
                   />
                 ) : (
@@ -539,6 +845,33 @@ export function Inspector({
             );
           })}
         </fieldset>
+        {v2 &&
+          !readonly &&
+          debug &&
+          ['http', 'transform', 'llm', 'agent', 'verify', 'condition'].includes(node.type) && (
+            <NodeDebug
+              node={draft}
+              workflow={workflow}
+              {...debug}
+              inputSchema={
+                node.type === 'http'
+                  ? connections
+                      .find((c) => c.ref === draft.config.connection_ref)
+                      ?.operations.find((op: any) => op.id === draft.config.operation_ref)
+                      ?.input_schema
+                  : undefined
+              }
+              prepare={async () => {
+                const { c, s } = await loadResources();
+                return authoringSnapshot(
+                  { ...workflow, input_schema: inputSchema, output_schema: outputSchema },
+                  draft,
+                  c,
+                  s,
+                );
+              }}
+            />
+          )}
         {result && (
           <div className="field">
             <label>本次节点输出</label>
@@ -546,6 +879,19 @@ export function Inspector({
           </div>
         )}
       </div>
+      {catalog && (
+        <ResourceBrowser
+          kind={catalog}
+          currentRefs={
+            catalog === 'skills'
+              ? draft.config.skills || []
+              : [draft.config.connection_ref].filter(Boolean)
+          }
+          operationRef={draft.config.operation_ref}
+          onClose={() => setCatalog(null)}
+          onSelect={readonly ? undefined : chooseResource}
+        />
+      )}
       {!readonly && (
         <div className="inspector-footer">
           <button

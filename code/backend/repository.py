@@ -12,6 +12,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from backend.data_policy import BUSINESS_DATA_POLICY, redact_business_data, validate_business_data
+from backend.identity import actor_ref
+
 
 def now() -> str:
     return datetime.now(UTC).isoformat()
@@ -83,6 +86,7 @@ class Repository:
         labels = {
             "model.called": "模型输入",
             "model.completed": "模型响应",
+            "skill.loaded": "Skill 装载",
             "node.completed": "节点结果",
             "tool.completed": "工具结果",
             "operation.reconciled": "读回对账",
@@ -103,9 +107,34 @@ class Repository:
 
     def put(self, kind: str, key: str, value: dict) -> dict:
         with self.transaction():
+            stored = redact(value)
+            if kind in ("skill", "skill_version"):
+                stored = validate_business_data(value)
+            if kind in ("release", "run", "binding") and "skills" in value.get("resolved_bindings", {}):
+                # Pinned Skill schemas are execution inputs, not audit payloads.
+                stored["resolved_bindings"]["skills"] = validate_business_data(value["resolved_bindings"]["skills"])
+            # Definitions are not audit payloads: preserve legitimate business field names.
+            definitions = {
+                "agent": ("workflow",),
+                "release": ("workflow",),
+                "run": ("workflow", "debug_node"),
+                "human_input": ("form_schema",),
+            }
+            for field in definitions.get(kind, ()):
+                if field in value:
+                    stored[field] = redact_business_data(value[field])
+            # Only explicitly versioned execution records use lossless business storage.
+            if value.get("business_data_policy") == BUSINESS_DATA_POLICY:
+                fields = {
+                    "run": ("inputs", "debug_inputs", "node_results", "result"),
+                    "human_input": ("payload", "inputs"),
+                }.get(kind, ())
+                for field in fields:
+                    if field in value:
+                        stored[field] = validate_business_data(value[field])
             self.db.execute(
                 "INSERT INTO records VALUES(?,?,?) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data",
-                (kind, key, dump(redact(value))),
+                (kind, key, dump(stored)),
             )
         return value
 
@@ -164,7 +193,7 @@ class Repository:
                     "node_id": node_id,
                     "agent_version": run.get("version"),
                     "parent_run_id": run.get("parent_run_id"),
-                    "actor_ref": "local-demo-operator",
+                    "actor_ref": actor_ref(run.get("submitted_by", "local-demo-operator")),
                     "attempt_id": extra.pop("attempt_id", None),
                     "operation_id": extra.pop("operation_id", None),
                     "evidence_refs": extra.pop("evidence_refs", []),

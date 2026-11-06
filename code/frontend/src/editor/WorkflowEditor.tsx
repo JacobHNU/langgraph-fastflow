@@ -26,6 +26,7 @@ import {
   AlertCircle,
   Globe,
   UserCheck,
+  Replace,
 } from 'lucide-react';
 import '@flowgram.ai/free-layout-editor/index.css';
 import { createFreeLinesPlugin } from '@flowgram.ai/free-lines-plugin';
@@ -44,6 +45,7 @@ const icons: Record<string, typeof Bot> = {
   managed_agent: Layers,
   subworkflow: Layers,
   http: Globe,
+  transform: Replace,
   human_input: UserCheck,
 };
 export const NodeIcon = ({ type, size = 18 }: { type: string; size?: number }) => {
@@ -133,9 +135,9 @@ function WorkflowNode({ node }: { node: WorkflowNodeEntity }) {
         <WorkflowPortRender
           key={port.id}
           entity={port}
-          primaryColor="#167c6b"
-          secondaryColor="#acb9b6"
-          backgroundColor="#fff"
+          primaryColor="var(--green)"
+          secondaryColor="var(--line)"
+          backgroundColor="var(--surface)"
         />
       ))}
     </>
@@ -264,12 +266,12 @@ export const WorkflowEditor = forwardRef<EditorHandle, Props>(function WorkflowE
       nodeEngine: { enable: false },
       variableEngine: { enable: false },
       lineColor: {
-        default: '#a7b8b4',
-        selected: '#147568',
-        hovered: '#147568',
-        flowing: '#147568',
-        error: '#d34c50',
-        drawing: '#147568',
+        default: 'var(--line)',
+        selected: 'var(--green)',
+        hovered: 'var(--green)',
+        flowing: 'var(--green)',
+        error: 'var(--danger)',
+        drawing: 'var(--green)',
         hidden: 'transparent',
       },
       canAddLine: (_ctx, from, to) =>

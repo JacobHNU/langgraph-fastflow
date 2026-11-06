@@ -219,7 +219,26 @@ def register_assistant(app, repo, settings, validate, resources=None):
             if resources:
                 from backend.v2 import CONFIG_MODELS, example_workflow
 
-                bundle["generic_example"] = example_workflow(resources)
+                bundle["workspace_skills"] = resources.repo.list("skill")
+                bundle["nodes"] = [
+                    *NODE_TYPES,
+                    *[
+                        {"type": kind, "schema_versions": ["2.0"]}
+                        for kind in CONFIG_MODELS
+                        if kind not in {n["type"] for n in NODE_TYPES}
+                    ],
+                ]
+                bundle["generic_example"] = (
+                    example_workflow(resources) if repo.get("connection", "conn_orders") else None
+                )
+                if (
+                    bundle["generic_example"]
+                    and repo.get("connection", "conn_orders_m11")
+                    and any(word in body.message for word in ("转换", "字段"))
+                ):
+                    from backend.m11 import integration_example
+
+                    bundle["generic_example"] = integration_example(resources)
                 bundle["v2_config_schemas"] = {kind: model.model_json_schema() for kind, model in CONFIG_MODELS.items()}
                 bundle["model_profiles"] = [{"ref": p["ref"], "name": p["name"]} for p in repo.list("model_profile")]
                 bundle["connections"] = [
@@ -252,6 +271,9 @@ def register_assistant(app, repo, settings, validate, resources=None):
                 "V2 首期节点仅 input/http/llm/agent/verify/human_input/condition/output；input_schema 和 output_schema 必须为 object。"
                 "V2 模型使用 model_ref、system_prompt、user_prompt_template 和 output_schema；模板仅支持 {{ field }} 与 {{ field | tojson }}。"
                 "HTTP 必须选择 connections 中的 connection_ref/operation_ref，并绑定 dependency_refs。"
+                "V2 Skill 只选 workspace_skills 的固定 ref，绑定到 Agent 的 config.skills 与 dependency_refs.skills；"
+                "将 Skill 的 connection_refs 加入连接依赖，tools 加入节点 tools、依赖 tools 和 policy.capability_refs。"
+                "Skill 使用 langchain_agent/deep_agent，映射其必填输入；不能在 Skill 中执行本地脚本。"
                 "V2 policy 使用 capability_refs、resource_scopes、max_model_calls/max_tool_calls 和 active_timeout_ms，不使用 tools/objects。"
                 "verify 使用 order-summary@1 或 schema@1；人工确认用 human_input，不能代替写审批。"
             )

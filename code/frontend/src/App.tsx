@@ -30,8 +30,12 @@ import {
 } from 'lucide-react';
 import { WorkflowEditor, NodeIcon, type EditorHandle } from './editor/WorkflowEditor';
 import { Inspector } from './editor/Inspector';
+import { authoringSnapshot, resourceVersions } from './editor/authoring';
+import { SkillManager } from './settings/SkillManager';
 import { RunMonitor, Status } from './run-monitor/RunMonitor';
-import { WorkspaceSettings } from './settings/WorkspaceSettings';
+import { SystemSettings } from './system/SystemSettings';
+import { AccountMenu, WorkspaceSwitcher } from './system/SystemRoot';
+import { useSystem } from './system/SystemContext';
 import { SchemaForm, validateForm } from './SchemaForm';
 import { ResizableHandle } from './ResizableHandle';
 import {
@@ -54,6 +58,8 @@ import {
   type Registry,
   type Run,
   type Workflow,
+  locationFor,
+  workspaceApiPath,
 } from './types';
 
 const terminal = ['SUCCEEDED', 'FAILED', 'CANCELLED', 'NEEDS_RECONCILIATION'];
@@ -65,6 +71,9 @@ const navItems = [
 ] as const;
 
 export default function App() {
+  const system = useSystem();
+  const archived = !!system.workspace.archived_at;
+  const [streamEpoch, setStreamEpoch] = useState(0);
   const [agents, setAgents] = useState<Agent[]>([]),
     [agent, setAgent] = useState<Agent | null>(null);
   const [workflow, setWorkflow] = useState<Workflow | null>(null),
@@ -131,7 +140,7 @@ export default function App() {
     setEvents([]);
     setEpoch((e) => e + 1);
     setNav('editor');
-    window.history.replaceState(null, '', location.pathname);
+    window.history.replaceState(null, '', locationFor(`workflow=${encodeURIComponent(next.id)}`));
   };
   useEffect(() => {
     const targetRun = new URLSearchParams(location.search).get('run');
@@ -148,7 +157,7 @@ export default function App() {
               list.find((a) => a.id === 'project-status') ||
               list[0],
           );
-        if (targetSettings === 'models') setNav('settings');
+        if (targetSettings) setNav('settings');
         if (targetRun) {
           const detail = await api<Run>(`/runs/${targetRun}`);
           const bound =
@@ -158,7 +167,7 @@ export default function App() {
           setRun(detail);
           setRunId(detail.id);
           setMonitor(true);
-          window.history.replaceState(null, '', `?run=${detail.id}`);
+          window.history.replaceState(null, '', locationFor(`run=${detail.id}`));
         }
       })
       .catch(handleError);
@@ -212,15 +221,28 @@ export default function App() {
   }, [nav, run?.status]);
   useEffect(() => {
     const params = new URLSearchParams(location.search);
-    if (nav === 'settings') params.set('settings', 'models');
+    if (nav === 'settings') params.set('settings', system.section);
     else params.delete('settings');
     const query = params.toString();
     window.history.replaceState(null, '', location.pathname + (query ? `?${query}` : ''));
-  }, [nav]);
+  }, [nav, system.section]);
+  useEffect(() => {
+    const resumed = () => setStreamEpoch((n) => n + 1);
+    window.addEventListener('session-restored', resumed);
+    return () => window.removeEventListener('session-restored', resumed);
+  }, []);
   useEffect(() => {
     if (!runId) return;
     let disposed = false;
-    const source = new EventSource(`/api/runs/${runId}/events`);
+    const source = new EventSource(workspaceApiPath(`/runs/${runId}/events`));
+    const expire = () => {
+      source.close();
+      clearInterval(fallback);
+    };
+    window.addEventListener('session-expired', expire);
+    source.addEventListener('session-expired', () => {
+      window.dispatchEvent(new Event('session-expired'));
+    });
     const refresh = () =>
       api<Run>(`/runs/${runId}`)
         .then((r) => {
@@ -260,8 +282,9 @@ export default function App() {
       disposed = true;
       source.close();
       clearInterval(fallback);
+      window.removeEventListener('session-expired', expire);
     };
-  }, [runId]);
+  }, [runId, streamEpoch]);
   const isActive = Boolean(run && run.agent_id === agent?.id && !terminal.includes(run.status));
   const releaseReady = Boolean(
     selectedRelease &&
@@ -374,7 +397,7 @@ export default function App() {
       setTab('result');
       setEpoch((e) => e + 1);
       setModal(null);
-      window.history.replaceState(null, '', `?run=${detail.id}`);
+      window.history.replaceState(null, '', locationFor(`run=${detail.id}`));
       notice(`运行已创建 · ${result.acceptance_ms} ms`);
     });
   const loadRun = async (item: Run) => {
@@ -391,7 +414,7 @@ export default function App() {
       setEpoch((e) => e + 1);
       setNav('editor');
       setSelectedNode(null);
-      window.history.replaceState(null, '', `?run=${detail.id}`);
+      window.history.replaceState(null, '', locationFor(`run=${detail.id}`));
     } catch (e) {
       handleError(e);
     }
@@ -406,82 +429,44 @@ export default function App() {
     setEpoch((e) => e + 1);
   };
   const applyNode = async (spec: NodeSpec, patch?: Partial<Workflow>) => {
-    const previous = workflow?.nodes.find((n) => n.id === spec.id);
-    const priorTools = [
-      ...(previous?.config.tools || []),
-      ...(previous?.config.operation_ref ? [previous.config.operation_ref] : []),
-    ];
-    const addedTools = [
-      ...(spec.config.tools || []),
-      ...(spec.config.operation_ref ? [spec.config.operation_ref] : []),
-    ].filter((ref) => !priorTools.includes(ref));
-    let connections: any[] = [];
-    if (workflow?.schema_version === '2.0') {
-      try {
-        connections = await api<any[]>('/connections');
-      } catch (e) {
-        handleError(e);
-        return;
-      }
-    }
-    editor.current?.update(spec);
     const snap = editor.current?.snapshot();
     if (snap) {
       if (patch) Object.assign(snap.workflow, patch);
       if (snap.workflow.schema_version === '2.0') {
-        const refs = (key: string) =>
-          Array.from(
-            new Set(snap.workflow.nodes.map((n) => n.config[key]).filter(Boolean)),
-          ) as string[];
-        const tools = Array.from(
-          new Set(
-            snap.workflow.nodes.flatMap((n) => [
-              ...(n.config.tools || []),
-              ...(n.type === 'http' && n.config.operation_ref ? [n.config.operation_ref] : []),
-            ]),
-          ),
-        ) as string[];
-        const toolConnections = [
-          ...(snap.workflow.dependency_refs?.connections || []),
-          ...connections
-            .filter((c) =>
-              c.operations.some(
-                (op: any) =>
-                  addedTools.includes(op.id) && (spec.config.tools || []).includes(op.id),
+        try {
+          const skillRefs = [
+            ...new Set(
+              snap.workflow.nodes.flatMap((n) =>
+                n.id === spec.id ? spec.config.skills || [] : n.config.skills || [],
               ),
-            )
-            .map((c) => c.ref),
-        ];
-        const hasAgentTools = snap.workflow.nodes.some((n) => (n.config.tools || []).length);
-        snap.workflow.dependency_refs = {
-          models: refs('model_ref'),
-          connections: Array.from(
-            new Set([...refs('connection_ref'), ...(hasAgentTools ? toolConnections : [])]),
-          ),
-          validators: refs('validator_ref'),
-          tools,
-          skills: [],
-          subgraphs: [],
-        };
-        snap.workflow.policy = {
-          ...snap.workflow.policy,
-          capability_refs: Array.from(
-            new Set([...(snap.workflow.policy.capability_refs || []), ...addedTools]),
-          ).filter((ref) => tools.includes(ref)),
-          resource_scopes: Array.from(
-            new Set([
-              ...(snap.workflow.policy.resource_scopes || []),
-              ...addedTools.map((ref) =>
-                ref === 'orders.list@1' ? 'orders:customer' : 'http:registered',
-              ),
-            ]),
-          ),
-        };
+            ),
+          ] as string[];
+          const skills = await resourceVersions('/skills', skillRefs);
+          const refs = [
+            ...(snap.workflow.dependency_refs?.connections || []),
+            spec.config.connection_ref,
+            ...skills.filter((s) => skillRefs.includes(s.ref)).flatMap((s) => s.connection_refs),
+          ].filter(Boolean);
+          const connections = await resourceVersions('/connections', refs);
+          snap.workflow = authoringSnapshot(
+            snap.workflow,
+            spec,
+            connections,
+            skills,
+            workflow || snap.workflow,
+          );
+        } catch (e) {
+          handleError(e);
+          return;
+        }
+      } else {
+        snap.workflow.nodes = snap.workflow.nodes.map((n) => (n.id === spec.id ? spec : n));
+        if (spec.config.skills?.length)
+          snap.workflow.skill_refs = Array.from(
+            new Set([...(snap.workflow.skill_refs || []), ...spec.config.skills]),
+          );
       }
-      if (spec.config.skills?.length)
-        snap.workflow.skill_refs = Array.from(
-          new Set([...(snap.workflow.skill_refs || []), ...spec.config.skills]),
-        );
+      editor.current?.update(spec);
       setWorkflow(snap.workflow);
       setLayout(snap.layout);
     }
@@ -542,7 +527,7 @@ export default function App() {
         }
         if (type === 'http') {
           const connections = await api<any[]>('/connections');
-          const c = connections[0],
+          const c = connections.find((c) => c.id === 'conn_orders') || connections[0],
             op = c?.operations[0];
           spec.config = { connection_ref: c?.ref, operation_ref: op?.id };
           spec.inputs = Object.fromEntries(
@@ -552,6 +537,16 @@ export default function App() {
             ]),
           );
           spec.output_schema = op?.response_schema;
+        }
+        if (type === 'transform') {
+          spec.config = { fields: { data: { path: ['data'], type: 'identity' } } };
+          spec.inputs = { data: { source: 'input', path: [] } };
+          spec.output_schema = {
+            type: 'object',
+            properties: { data: {} },
+            required: ['data'],
+            additionalProperties: false,
+          };
         }
         if (type === 'verify') {
           spec.config = { validator_ref: 'schema@1', schema: { type: 'object' } };
@@ -609,7 +604,7 @@ export default function App() {
     });
   const guard = (action: () => void) => {
     if (dirty && !monitor) setPendingAction({ action });
-    else action();
+    else system.guardSettings(action);
   };
   const getSnapshot = (): Snapshot => editor.current?.snapshot() || { workflow: workflow!, layout };
   const copyAgent = (target: Agent) =>
@@ -813,13 +808,27 @@ export default function App() {
           <strong>Workflow Studio</strong>
           <button onClick={() => setNav('agents')}>工作流管理</button>
           <button onClick={() => setNav('runs')}>运行记录</button>
-          <button title="工作空间设置" onClick={() => setNav('settings')}>
+          <WorkspaceSwitcher
+            guard={guard}
+            onManage={() => {
+              system.setSection('workspaces');
+              setNav('settings');
+            }}
+          />
+          <button title="系统设置" onClick={() => guard(() => setNav('settings'))}>
             设置
           </button>
+          <AccountMenu
+            guard={guard}
+            onAccount={() => {
+              system.setSection('account');
+              setNav('settings');
+            }}
+          />
         </header>
         <main className="empty-workspace">
           {nav === 'settings' ? (
-            <WorkspaceSettings onSaved={() => {}} />
+            <SystemSettings onSaved={() => {}} />
           ) : nav === 'runs' ? (
             <div className="content-page">
               <h1>运行记录</h1>
@@ -847,11 +856,13 @@ export default function App() {
             Workflow <span>Studio</span>
           </strong>
         </a>
-        <div className="workspace-name">
-          <span />
-          本地工作空间
-          <ChevronDown size={12} />
-        </div>
+        <WorkspaceSwitcher
+          guard={guard}
+          onManage={() => {
+            system.setSection('workspaces');
+            setNav('settings');
+          }}
+        />
         <nav>
           {navItems.map(([key, title, Icon]) => (
             <button
@@ -872,20 +883,28 @@ export default function App() {
           <button
             className="icon-button"
             onClick={() => guard(() => setNav('settings'))}
-            title="工作空间设置"
+            title="系统设置"
           >
             <Settings2 size={17} />
           </button>
-          <span className="avatar" title="本地演示操作员">
-            J
-          </span>
+          <AccountMenu
+            guard={guard}
+            onAccount={() => {
+              system.setSection('account');
+              setNav('settings');
+            }}
+          />
         </div>
       </header>
       <div className="app-body">
         <aside className="sidebar">
           <div className="sidebar-heading">
             <span>业务工作流</span>
-            <NewWorkflowMenu onNew={newWorkflow} onCopy={() => guard(duplicate)} />
+            <NewWorkflowMenu
+              disabled={archived}
+              onNew={newWorkflow}
+              onCopy={() => guard(duplicate)}
+            />
           </div>
           <div className="sidebar-search">
             <Search size={14} />
@@ -932,7 +951,9 @@ export default function App() {
                     </span>
                     <ChevronRight size={12} />
                   </button>
-                  <WorkflowRowMenu agent={a} onManage={manageWorkflow} onCopy={copyAgent} />
+                  {!archived && (
+                    <WorkflowRowMenu agent={a} onManage={manageWorkflow} onCopy={copyAgent} />
+                  )}
                 </div>
               ))}
           </div>
@@ -967,10 +988,15 @@ export default function App() {
                     {monitor ? `运行版本 v${run?.version}` : '草稿'}
                   </span>
                   {dirty && !monitor && <span className="unsaved-dot" title="有未保存的修改" />}
+                  {archived && <span className="tag amber">已归档 · 只读</span>}
                 </div>
                 <div className="workflow-actions">
                   {monitor ? (
-                    <button className="secondary" onClick={edit} disabled={!!agent.deleted_at}>
+                    <button
+                      className="secondary"
+                      onClick={edit}
+                      disabled={archived || !!agent.deleted_at}
+                    >
                       <Code2 size={14} />
                       编辑草稿
                     </button>
@@ -978,7 +1004,7 @@ export default function App() {
                     <>
                       <button
                         className="secondary"
-                        disabled={busy}
+                        disabled={busy || archived}
                         onClick={() =>
                           perform(async () => {
                             await save();
@@ -989,11 +1015,15 @@ export default function App() {
                         <Save size={14} />
                         <span>保存</span>
                       </button>
-                      <button className="secondary" disabled={busy} onClick={validate}>
+                      <button className="secondary" disabled={busy || archived} onClick={validate}>
                         <ShieldCheck size={14} />
                         <span>校验</span>
                       </button>
-                      <button className="secondary" disabled={busy} onClick={preparePublish}>
+                      <button
+                        className="secondary"
+                        disabled={busy || archived}
+                        onClick={preparePublish}
+                      >
                         <Rocket size={14} />
                         <span>发布</span>
                       </button>
@@ -1001,7 +1031,7 @@ export default function App() {
                   )}
                   <button
                     className="primary run-button"
-                    disabled={busy || isActive || !releaseReady}
+                    disabled={busy || archived || isActive || !releaseReady}
                     onClick={() => guard(launch)}
                   >
                     {busy ? (
@@ -1042,7 +1072,7 @@ export default function App() {
                         {monitor ? '运行视图' : '流程编排'}
                       </span>
                       <div className="canvas-tools">
-                        {!monitor && (
+                        {!monitor && !archived && (
                           <>
                             <button
                               className="tool-button"
@@ -1072,6 +1102,7 @@ export default function App() {
                         <button
                           className="icon-button"
                           title="自动布局"
+                          disabled={archived}
                           onClick={() => editor.current?.layout()}
                         >
                           <LayoutGrid size={16} />
@@ -1086,7 +1117,7 @@ export default function App() {
                         <button className="icon-button" title="导出流程 JSON" onClick={exportJson}>
                           <Download size={16} />
                         </button>
-                        {!monitor && (
+                        {!monitor && !archived && (
                           <>
                             <button
                               className="icon-button"
@@ -1129,7 +1160,7 @@ export default function App() {
                       }}
                       states={nodeStates}
                       errors={new Set(validationErrors.map((e) => e.node_id))}
-                      readonly={monitor}
+                      readonly={monitor || !!system.workspace.archived_at}
                     />
                     <div className="canvas-legend">
                       <span>
@@ -1255,7 +1286,7 @@ export default function App() {
                       <WorkflowAssistant
                         key={agent.id}
                         agent={agent}
-                        readonly={monitor || !!agent.deleted_at}
+                        readonly={monitor || !!agent.deleted_at || !!system.workspace.archived_at}
                         getSnapshot={getSnapshot}
                         onApply={applyProposal}
                         onCreate={createProposal}
@@ -1293,8 +1324,9 @@ export default function App() {
                           setDirty(true);
                         }}
                         onClose={() => setSelectedNode(null)}
-                        readonly={monitor}
+                        readonly={monitor || !!system.workspace.archived_at}
                         result={run?.node_results?.[node.id]}
+                        debug={{ agentId: agent.id, revision: agent.revision, layout }}
                       />
                     ) : (
                       <div className="run-config">
@@ -1453,7 +1485,7 @@ export default function App() {
                         <div className="run-config-footer">
                           <button
                             className="primary"
-                            disabled={busy || isActive || !releaseReady}
+                            disabled={busy || archived || isActive || !releaseReady}
                             onClick={() => guard(launch)}
                           >
                             <Play size={14} fill="currentColor" />
@@ -1534,8 +1566,10 @@ export default function App() {
                   <span className="eyebrow">CAPABILITIES</span>
                   <h1>Skills</h1>
                 </div>
-                <span className="tag">只读 · 版本绑定</span>
+                <span className="tag">工作区隔离 · 固定版本</span>
               </div>
+              <SkillManager />
+              <h2>内置兼容示例（V1）</h2>
               {registry.skills.map((s) => (
                 <section className="skill-section" key={s.id}>
                   <h2>
@@ -1559,53 +1593,11 @@ export default function App() {
             </div>
           ) : (
             <div className="content-page">
-              <div className="page-heading">
-                <div>
-                  <span className="eyebrow">WORKSPACE</span>
-                  <h1>工作空间设置</h1>
-                </div>
-              </div>
-              <WorkspaceSettings
+              <SystemSettings
                 onSaved={() => {
                   api('/health').then(setHealth).catch(handleError);
                 }}
               />
-              <div className="settings-section">
-                <h2>当前环境</h2>
-                <dl className="config-facts">
-                  <div>
-                    <dt>模型</dt>
-                    <dd>{health?.model_mode === 'demo' ? '离线演示模型' : health?.model_mode}</dd>
-                  </div>
-                  <div>
-                    <dt>身份</dt>
-                    <dd>本地演示操作员</dd>
-                  </div>
-                  <div>
-                    <dt>业务数据</dt>
-                    <dd>本地测试项目</dd>
-                  </div>
-                  <div>
-                    <dt>工作流引擎</dt>
-                    <dd>LangGraph</dd>
-                  </div>
-                  {Object.entries(health?.dependencies || {}).map(([k, v]) => (
-                    <div key={k}>
-                      <dt>{k}</dt>
-                      <dd>{String(v)}</dd>
-                    </div>
-                  ))}
-                </dl>
-                <a
-                  className="text-button"
-                  href="http://127.0.0.1:8000/docs"
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  API 文档
-                  <ArrowRight size={14} />
-                </a>
-              </div>
             </div>
           )}
         </main>
@@ -1613,7 +1605,8 @@ export default function App() {
       <footer className="status-bar">
         <span>
           <span className="online-dot" />
-          本地工作空间
+          {system.workspace.name}
+          {system.workspace.archived_at ? ' · 已归档，只读' : ''}
         </span>
         <span>
           FlowGram <span className="status-divider">/</span> LangGraph{' '}
@@ -1664,6 +1657,7 @@ export default function App() {
                       (workflow?.schema_version === '2.0'
                         ? [
                             'http',
+                            'transform',
                             'llm',
                             'agent',
                             'verify',
@@ -1761,6 +1755,39 @@ export default function App() {
                       }}
                     >
                       选择版本
+                    </button>
+                    <button
+                      className="secondary"
+                      disabled={v.revoked || v.workflow.schema_version !== '2.0' || busy}
+                      title="导出不可变发布包，可在独立 Runtime 中导入"
+                      onClick={() =>
+                        perform(async () => {
+                          const job = await api(
+                            `/agents/${agent!.id}/versions/${v.version}/export-jobs`,
+                            'POST',
+                            {
+                              container: 'tar.gz',
+                            },
+                          );
+                          const link = document.createElement('a');
+                          const response = await fetch(
+                            workspaceApiPath(`/export-jobs/${job.id}/download?inline=true`),
+                          );
+                          if (!response.ok) throw new Error('发布包下载失败，请重新登录后重试');
+                          const url = URL.createObjectURL(await response.blob());
+                          link.href = url;
+                          link.download = `fastflow-${agent!.id}-${v.version}.tar.gz`;
+                          document.body.append(link);
+                          link.click();
+                          link.remove();
+                          setTimeout(() => URL.revokeObjectURL(url), 30000);
+                          notice(
+                            `已导出发布包 v${v.version}，包摘要 ${job.package_digest.slice(0, 12)}`,
+                          );
+                        })
+                      }
+                    >
+                      <Download size={14} /> 导出 .tar.gz
                     </button>
                     <button
                       className="icon-button danger"

@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page } from './fixtures';
 
 async function send(page: Page, text: string) {
   await page.getByLabel('编排需求').fill(text);
@@ -170,7 +170,7 @@ test('chat previews, applies and undoes edits, rejects stale proposals and creat
 });
 
 test('empty workspace remains usable and can create a workflow', async ({ page }) => {
-  await page.route('**/api/agents', async (route) => {
+  await page.route('**/api/workspaces/*/agents', async (route) => {
     if (route.request().method() === 'GET') await route.fulfill({ json: [] });
     else await route.continue();
   });

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Bot, Loader2, Plus, Send, Undo2 } from 'lucide-react';
-import { api, pretty, type Agent, type Layout, type Workflow } from './types';
+import { api, pretty, storageScope, type Agent, type Layout, type Workflow } from './types';
 
 export type Snapshot = { workflow: Workflow; layout: Layout };
 export const stable = (value: any): string =>
@@ -42,7 +42,7 @@ export function WorkflowAssistant({
   const [names, setNames] = useState<Record<string, string>>({});
   const [applied, setApplied] = useState<Record<string, boolean>>({});
   const bottom = useRef<HTMLDivElement>(null);
-  const key = `workflow-chat:${mode}:${mode === 'edit' ? agent.id : 'new'}`;
+  const key = `workflow-chat:${storageScope()}:${mode}:${mode === 'edit' ? agent.id : 'new'}`;
   useEffect(() => {
     let active = true;
     const refresh = () => {

@@ -1,5 +1,6 @@
 import asyncio
 import operator
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -7,8 +8,10 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command, interrupt
 
 from backend.compiler import compile_workflow, resolve
+from backend.data_policy import BUSINESS_DATA_POLICY, contains_redacted, validate_business_data
 from backend.executors.agents import execute_model
 from backend.executors.models import model_mode, parse_json
+from backend.identity import actor_ref
 from backend.invocations import InvocationGateway
 from backend.model_settings import ModelSettingsStore
 from backend.repository import digest, dump, now, uid
@@ -20,18 +23,27 @@ TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED", "NEEDS_RECONCILIATION"}
 
 
 class Runtime:
-    def __init__(self, repo):
+    def __init__(self, repo, pool=None):
         self.repo = repo
-        self.model_settings = ModelSettingsStore(repo.root)
+        self.model_settings = ModelSettingsStore(
+            repo.root,
+            allow_environment=getattr(repo, "allow_environment", True)
+            and getattr(repo, "workspace_id", "ws_legacy") == "ws_legacy",
+        )
         self.resources = ResourceService(repo, self.model_settings)
         self.gateway = InvocationGateway(repo, self.resources)
         self.tools = BusinessTools(repo)
-        self.pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="workflow-worker")
+        self.pool = pool or ThreadPoolExecutor(max_workers=3, thread_name_prefix="workflow-worker")
+        self.slots = getattr(self.pool, "workflow_slots", threading.BoundedSemaphore(3))
         self.active = {}
         self.stopping = False
 
     def recover(self):
         for run in self.repo.list("run"):
+            if run["status"] in TERMINAL:
+                # Repair old orphaned tasks without inventing a human decision.
+                with self.repo.transaction():
+                    self.close_pending(run, recovered=True)
             if run["status"] == "RUNNING":
                 if run.get("parent_run_id"):
                     # Its parent resumes the bound child; never schedule both independently.
@@ -66,22 +78,13 @@ class Runtime:
                         logging.getLogger(__name__).exception("Worker task failed: %s", type(exc).__name__)
                     del self.active[key]
             for run in reversed(self.repo.list("run")):
-                if run["status"] == "AWAITING_INPUT":
-                    pending = [
-                        r
-                        for r in self.repo.list("human_input")
-                        if r["run_id"] == run["id"] and r["status"] == "PENDING"
-                    ]
-                    if pending and pending[0]["expires_at"] < time.time():
-                        self.finish(
-                            run["id"], "CANCELLED", error={"code": "INPUT_EXPIRED", "message": "人工确认已超过有效期"}
-                        )
+                if run["status"] in ("AWAITING_INPUT", "AWAITING_APPROVAL"):
+                    self.expire_waiting(run["id"])
                 if len(self.active) >= 3:
-                    break
+                    continue
                 key = "run:" + run["id"]
                 if run["status"] == "QUEUED" and key not in self.active:
-                    self.repo.update("run", run["id"], status="RUNNING")
-                    self.active[key] = self.pool.submit(self.execute, run["id"])
+                    self.schedule(key, run["id"])
                 evaluation_key = "eval:" + run["id"]
                 if (
                     run["status"] in TERMINAL
@@ -89,16 +92,41 @@ class Runtime:
                     and evaluation_key not in self.active
                     and len(self.active) < 3
                 ):
-                    self.repo.update("run", run["id"], evaluation_status="RUNNING")
-                    self.active[evaluation_key] = self.pool.submit(self.evaluate, run["id"])
+                    self.schedule(evaluation_key, run["id"], evaluation=True)
             await asyncio.sleep(0.12)
 
-    def create_run(self, request, parent_run_id=None, inherited_policy=None):
+    def schedule(self, key, run_id, evaluation=False):
+        if not self.slots.acquire(blocking=False):
+            return
+        try:
+            with self.repo.transaction():
+                run = self.repo.get("run", run_id)
+                eligible = (
+                    run["status"] in TERMINAL and run.get("evaluation_status") == "PENDING"
+                    if evaluation
+                    else run["status"] == "QUEUED"
+                )
+                if not eligible:
+                    self.slots.release()
+                    return
+                self.repo.update(
+                    "run", run_id, **({"evaluation_status": "RUNNING"} if evaluation else {"status": "RUNNING"})
+                )
+                future = self.pool.submit(self.evaluate if evaluation else self.execute, run_id)
+            future.add_done_callback(lambda _future: self.slots.release())
+            self.active[key] = future
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def create_run(self, request, parent_run_id=None, inherited_policy=None, submitted_by=None):
         repo = self.repo
         with repo.transaction():
             payload = request.model_dump() if hasattr(request, "model_dump") else request
             request_hash = digest({k: v for k, v in payload.items() if k != "idempotency_key"})
-            idempotency_id = digest({"actor": "local-demo-operator", "key": payload["idempotency_key"]})
+            parent = repo.get("run", parent_run_id) if parent_run_id else None
+            submitted_by = submitted_by or (parent or {}).get("submitted_by") or actor_ref()
+            idempotency_id = digest({"actor": submitted_by, "key": payload["idempotency_key"]})
             existing = repo.get("idempotency", idempotency_id)
             if existing:
                 if existing["request_hash"] != request_hash:
@@ -116,6 +144,7 @@ class Runtime:
                 from backend.schema_validation import validate_data
 
                 inputs = validate_data(workflow.input_schema, payload["inputs"])
+                validate_business_data(inputs)
             else:
                 inputs = ProjectInput.model_validate(payload["inputs"]).model_dump()
             if not v2 and inputs["project_id"] not in workflow.policy.get("objects", []):
@@ -139,11 +168,13 @@ class Runtime:
             run_id = uid("run")
             run = {
                 "id": run_id,
+                "submitted_by": submitted_by,
                 "agent_id": payload["agent_id"],
                 "agent_name": release["name"],
                 "version": payload["version"],
                 "entrypoint": "run",
                 "inputs": inputs,
+                "business_data_policy": BUSINESS_DATA_POLICY if v2 else None,
                 "workflow": workflow.model_dump(by_alias=True),
                 "layout": release["layout"],
                 "release_digest": release["sha256"],
@@ -170,6 +201,19 @@ class Runtime:
                     raise BusinessError("VERSION_UNAVAILABLE", "V2 发布版本缺少固定依赖")
                 model_bindings = run["resolved_bindings"].get("models", {})
                 run["model_mode"] = next(iter(model_bindings.values()))["config"]["mode"] if model_bindings else "demo"
+            from backend.package_archive import canonical, sha
+
+            run["execution_source"] = "local_release"
+            run["execution_snapshot_digest"] = sha(
+                canonical(
+                    {
+                        "workflow": run["workflow"],
+                        "release_digest": run["release_digest"],
+                        "resolved_bindings": run["resolved_bindings"],
+                        "submitted_by": submitted_by,
+                    }
+                )
+            )
             repo.put("run", run_id, run)
             repo.put("idempotency", idempotency_id, {"run_id": run_id, "request_hash": request_hash})
             repo.event(
@@ -184,13 +228,94 @@ class Runtime:
             )
             return run
 
+    def create_debug_run(self, agent_id, revision, workflow, layout, node_id, inputs):
+        from backend.v2 import semantic_digest, validate_v2
+
+        if workflow.schema_version != "2.0":
+            raise BusinessError("CAPABILITY_UNAVAILABLE", "节点试跑仅支持 V2 草稿")
+        node = next((n for n in workflow.nodes if n.id == node_id), None)
+        if not node or node.type not in ("http", "transform", "llm", "agent", "verify", "condition"):
+            raise BusinessError(
+                "POLICY_DENIED", "仅可试跑只读 HTTP、转换、模型、条件或核验节点；人工确认和业务提交必须通过完整流程"
+            )
+        if len(dump(inputs).encode()) > 120000:
+            raise BusinessError("INPUT_INVALID", "调试输入超过 120KB 上限")
+        validate_business_data(inputs)
+        selected = node.model_copy(deep=True)
+        selected.inputs = {key: {"source": "constant", "value": value} for key, value in inputs.items()}
+        check = workflow.model_copy(deep=True)
+        check.nodes = [n for n in workflow.nodes if n.type == "input"][:1] + [selected]
+        errors = []
+        validate_v2(check, self.resources, lambda message, node_id=None: errors.append(message))
+        if errors:
+            raise BusinessError("DSL_INVALID", "; ".join(errors))
+        with self.repo.transaction():
+            agent = self.repo.get("agent", agent_id)
+            if not agent or agent.get("deleted_at"):
+                raise BusinessError("WORKFLOW_DELETED", "工作流不存在或已移入回收站")
+            if revision != agent["revision"]:
+                raise BusinessError("REVISION_CONFLICT", "草稿版本已变化，请重新加载后试跑")
+            run_id = uid("run")
+            bindings = self.resources.bindings(workflow)
+            run = {
+                "id": run_id,
+                "submitted_by": actor_ref(),
+                "agent_id": agent_id,
+                "agent_name": agent["name"] + " · 节点试跑",
+                "version": "draft",
+                "entrypoint": "node_debug",
+                "debug_node_id": node_id,
+                "debug_inputs": inputs,
+                "business_data_policy": BUSINESS_DATA_POLICY,
+                "debug_node": selected.model_dump(by_alias=True),
+                "draft_revision": revision,
+                "inputs": inputs,
+                "workflow": workflow.model_dump(by_alias=True),
+                "layout": layout,
+                "release_digest": semantic_digest(workflow.model_dump(by_alias=True)),
+                "skill_hashes": [{"ref": ref, "sha256": s["sha256"]} for ref, s in bindings.get("skills", {}).items()],
+                "resolved_bindings": bindings,
+                "status": "QUEUED",
+                "evaluation_status": "SKIPPED",
+                "created_at": now(),
+                "parent_run_id": None,
+                "conversation_id": None,
+                "checkpoint_thread_id": run_id,
+                "cancel_requested": False,
+                "result": None,
+                "node_results": {},
+                "error": None,
+                "model_mode": next(iter(bindings["models"].values()))["config"]["mode"]
+                if bindings["models"]
+                else "demo",
+                "active_elapsed_ms": 0,
+                "depth": 0,
+            }
+            self.repo.put("run", run_id, run)
+            self.repo.event(
+                run_id,
+                "run.created",
+                node_id,
+                {
+                    "entrypoint": "node_debug",
+                    "draft_revision": revision,
+                    "snapshot_digest": run["release_digest"],
+                    "inputs": inputs,
+                },
+            )
+            return run
+
     def execute(self, run_id):
         repo = self.repo
         run = repo.get("run", run_id)
+        if run["status"] in TERMINAL:
+            return
         if run["cancel_requested"]:
             self.finish(run_id, "CANCELLED")
             return
         workflow = Workflow.model_validate(run["workflow"])
+        if run.get("execution_source") == "package":
+            workflow = workflow.model_copy(update={"policy": run["effective_policy"]})
         started = time.monotonic()
         run["_segment_started"] = started
         repo.event(
@@ -200,9 +325,27 @@ class Runtime:
         )
         try:
             with SqliteSaver.from_conn_string(str(repo.root / "checkpoints.db")) as saver:
-                graph = compile_workflow(
-                    workflow, lambda node: self.make_node(node, run, workflow), saver, self.resources
-                )
+                if run.get("entrypoint") == "node_debug":
+                    from langgraph.graph import END, START, StateGraph
+
+                    from backend.compiler import WorkflowState
+                    from backend.schemas import Node
+
+                    node = Node.model_validate(run["debug_node"])
+                    builder = StateGraph(WorkflowState)
+                    builder.add_node(node.id, self.make_node(node, run, workflow))
+                    builder.add_edge(START, node.id)
+                    builder.add_edge(node.id, END)
+                    graph = builder.compile(checkpointer=saver)
+                else:
+                    from backend.packages import PackageResourceResolver
+
+                    resources = (
+                        PackageResourceResolver(run["resolved_bindings"]) if run.get("package_id") else self.resources
+                    )
+                    graph = compile_workflow(
+                        workflow, lambda node: self.make_node(node, run, workflow), saver, resources
+                    )
                 config = {"configurable": {"thread_id": run_id}, "recursion_limit": 90}
                 if run.get("resume"):
                     value = Command(resume=run["resume"])
@@ -214,21 +357,30 @@ class Runtime:
                 snapshot = graph.get_state(config)
                 active_elapsed_ms = round(run.get("active_elapsed_ms", 0) + (time.monotonic() - started) * 1000, 2)
                 if snapshot.next:
-                    repo.update(
-                        "run",
-                        run_id,
-                        status="AWAITING_INPUT"
-                        if any(r["run_id"] == run_id and r["status"] == "PENDING" for r in repo.list("human_input"))
-                        else "AWAITING_APPROVAL",
-                        node_results=snapshot.values.get("results", {}),
-                        resume=None,
-                        active_elapsed_ms=active_elapsed_ms,
-                    )
+                    with repo.transaction():
+                        current = repo.get("run", run_id)
+                        if current["cancel_requested"]:
+                            self.finish(run_id, "CANCELLED")
+                        elif current["status"] not in TERMINAL:
+                            repo.update(
+                                "run",
+                                run_id,
+                                status="AWAITING_INPUT"
+                                if any(
+                                    r["run_id"] == run_id and r["status"] == "PENDING" for r in repo.list("human_input")
+                                )
+                                else "AWAITING_APPROVAL",
+                                node_results=snapshot.values.get("results", {}),
+                                resume=None,
+                                active_elapsed_ms=active_elapsed_ms,
+                            )
                 else:
                     self.finish(
                         run_id,
                         "SUCCEEDED",
-                        result=result.get("final"),
+                        result=result.get("results", {}).get(run["debug_node_id"])
+                        if run.get("entrypoint") == "node_debug"
+                        else result.get("final"),
                         node_results=result.get("results", {}),
                         duration_ms=active_elapsed_ms,
                         active_elapsed_ms=active_elapsed_ms,
@@ -241,7 +393,12 @@ class Runtime:
                 if exc.code == "CANCELLED"
                 else "FAILED"
             )
-            self.finish(run_id, status, error={"code": exc.code, "message": exc.message})
+            self.finish(
+                run_id,
+                status,
+                error={"code": exc.code, "message": exc.message},
+                duration_ms=round(run.get("active_elapsed_ms", 0) + (time.monotonic() - started) * 1000, 2),
+            )
         except Exception as exc:
             import logging
 
@@ -254,18 +411,94 @@ class Runtime:
                 if any(x in name for x in ("API", "Authentication", "Connection", "RateLimit"))
                 else "EXECUTION_FAILED"
             )
-            self.finish(run_id, "FAILED", error={"code": code, "message": f"执行失败：{name}。详细信息见后端日志。"})
+            self.finish(
+                run_id,
+                "FAILED",
+                error={"code": code, "message": f"执行失败：{name}。详细信息见后端日志。"},
+                duration_ms=round(run.get("active_elapsed_ms", 0) + (time.monotonic() - started) * 1000, 2),
+            )
 
     def finish(self, run_id, status, **extra):
+        if "duration_ms" in extra:
+            extra.setdefault("active_elapsed_ms", extra["duration_ms"])
         with self.repo.transaction():
-            self.repo.update("run", run_id, status=status, finished_at=now(), resume=None, **extra)
+            run = self.repo.get("run", run_id)
+            if run["status"] in TERMINAL:
+                self.close_pending(run)
+                return run
+            if run.get("cancel_requested") and status == "SUCCEEDED":
+                status = "CANCELLED"
+            run = self.repo.update("run", run_id, status=status, finished_at=now(), resume=None, **extra)
+            self.close_pending(run)
             self.repo.event(run_id, "run.finished", payload={"status": status, **extra})
+            return run
+
+    def close_pending(self, run, recovered=False):
+        """Called inside the same transaction as the terminal run transition."""
+        reason = (run.get("error") or {}).get("code") or "RUN_" + run["status"]
+        status = (
+            "EXPIRED"
+            if reason in ("INPUT_EXPIRED", "APPROVAL_EXPIRED")
+            else ("CANCELLED" if run["status"] == "CANCELLED" else "CLOSED")
+        )
+        actor = actor_ref("runtime")
+        for kind, prefix in (("human_input", "input"), ("approval", "approval")):
+            for record in self.repo.list(kind):
+                if record["run_id"] != run["id"] or record["status"] != "PENDING":
+                    continue
+                changes = {
+                    "status": status,
+                    "revision": record.get("revision", 1) + 1,
+                    "closed_at": now(),
+                    "closure_reason": reason,
+                    "closed_by": actor,
+                }
+                self.repo.update(kind, record["id"], **changes)
+                self.repo.event(
+                    run["id"],
+                    prefix + ".closed",
+                    record["node_id"],
+                    {"task_id": record["id"], **changes, "recovered": recovered},
+                    actor_ref=actor,
+                )
+
+    def expire_waiting(self, run_id):
+        with self.repo.transaction():
+            run = self.repo.get("run", run_id)
+            if run["status"] not in ("AWAITING_INPUT", "AWAITING_APPROVAL"):
+                return
+            kind = "human_input" if run["status"] == "AWAITING_INPUT" else "approval"
+            pending = [r for r in self.repo.list(kind) if r["run_id"] == run_id and r["status"] == "PENDING"]
+            if any(r["expires_at"] < time.time() for r in pending):
+                self.finish(
+                    run_id,
+                    "CANCELLED",
+                    error={
+                        "code": "INPUT_EXPIRED" if kind == "human_input" else "APPROVAL_EXPIRED",
+                        "message": "人工任务已超过有效期",
+                    },
+                )
+
+    def request_human_task(self, kind, record, event_type, payload):
+        with self.repo.transaction():
+            run = self.repo.get("run", record["run_id"])
+            if run["status"] in TERMINAL or run.get("cancel_requested"):
+                raise BusinessError("CANCELLED", "运行已结束或正在取消，不能新建人工任务")
+            existing = self.repo.get(kind, record["id"])
+            if existing:
+                return existing
+            self.repo.put(kind, record["id"], record)
+            self.repo.event(run["id"], event_type, record["node_id"], payload)
+            return record
 
     def make_node(self, node, run, workflow):
         repo = self.repo
 
         def execute(state):
             current = repo.get("run", run["id"])
+            from backend.packages import check_deployment_boundary
+
+            check_deployment_boundary(repo, current)
             if current["cancel_requested"]:
                 raise BusinessError("CANCELLED", "已在节点边界确认停止")
             started = time.monotonic()
@@ -289,6 +522,7 @@ class Runtime:
             inputs = resolve(node.inputs, state)
             context = {
                 "run_id": run["id"],
+                "actor": run.get("submitted_by", "local-demo-operator"),
                 "node_id": node.id,
                 "agent_id": run["agent_id"],
                 "policy": workflow.policy,
@@ -333,6 +567,10 @@ class Runtime:
                     data = self.gateway.call(
                         node.config["operation_ref"], inputs, context, node.config["connection_ref"]
                     )
+                elif node.type == "transform":
+                    from backend.transforms import transform
+
+                    data = transform(node.config, inputs)
                 elif node.type == "human_input":
                     request_id = "input_" + digest({"run": run["id"], "node": node.id})[:20]
                     pending = repo.get("human_input", request_id)
@@ -345,22 +583,30 @@ class Runtime:
                             "status": "PENDING",
                             "title": node.title or "人工确认",
                             "inputs": inputs,
+                            "business_data_policy": run.get("business_data_policy"),
                             "input_digest": digest(inputs),
                             "form_schema": node.config.get("form_schema", {"type": "object", "properties": {}}),
                             "created_at": now(),
                             "expires_at": time.time() + node.config.get("wait_ttl_seconds", 86400),
                         }
-                        repo.put("human_input", request_id, pending)
-                        repo.event(run["id"], "input.requested", node.id, {"request_id": request_id, "inputs": inputs})
+                        self.request_human_task(
+                            "human_input", pending, "input.requested", {"request_id": request_id, "inputs": inputs}
+                        )
                     decision = interrupt({"request_id": request_id, "inputs": inputs})
                     pending = repo.get("human_input", request_id)
-                    if pending["expires_at"] < time.time() or pending["input_digest"] != digest(inputs):
+                    if pending["input_digest"] != digest(inputs):
                         raise BusinessError("INPUT_EXPIRED", "人工确认过期或内容已变化")
                     if decision.get("request_id") != request_id or pending["status"] not in ("ACCEPTED", "REJECTED"):
                         raise BusinessError("INPUT_CONFLICT", "人工确认记录不匹配")
                     if pending["status"] == "REJECTED":
                         raise BusinessError("CANCELLED", "人工已拒绝摘要，运行取消")
-                    payload = validate_data(pending["form_schema"], pending.get("payload", {}))
+                    payload = pending.get("payload", {})
+                    if pending.get("business_data_policy") != BUSINESS_DATA_POLICY and contains_redacted(payload):
+                        raise BusinessError(
+                            "INPUT_FEEDBACK_UNRECOVERABLE", "历史人工反馈已脱敏且原值不可恢复，请重新发起运行并提交反馈"
+                        )
+                    validate_business_data(payload)
+                    payload = validate_data(pending["form_schema"], payload)
                     data = {**payload, "accepted": True}
                 elif node.type in ("python", "python_workflow"):
                     data = self.tools.call(node.config["function_ref"], inputs, context)
@@ -394,14 +640,14 @@ class Runtime:
                             "id": approval_id,
                             "run_id": run["id"],
                             "node_id": node.id,
+                            "revision": 1,
                             "status": "PENDING",
                             "plan": plan,
                             "plan_digest": digest(plan),
                             "expires_at": time.time() + 900,
                             "created_at": now(),
                         }
-                        repo.put("approval", approval_id, approval)
-                        repo.event(run["id"], "approval.requested", node.id, approval)
+                        self.request_human_task("approval", approval, "approval.requested", approval)
                     decision = interrupt({"approval_id": approval_id, "plan": plan})
                     approval = repo.get("approval", approval_id)
                     if decision.get("decision") != "approve" or approval["status"] != "APPROVED":
@@ -475,11 +721,21 @@ class Runtime:
                 return complete(data, state, inputs, started, attempt_id)
             except BusinessError as exc:
                 repo.event(
-                    run["id"], "node.failed", node.id, {"code": exc.code, "message": exc.message}, attempt_id=attempt_id
+                    run["id"],
+                    "node.failed",
+                    node.id,
+                    {
+                        "code": exc.code,
+                        "message": exc.message,
+                        "duration_ms": round((time.monotonic() - started) * 1000, 2),
+                    },
+                    attempt_id=attempt_id,
                 )
                 raise
 
         def complete(data, state, inputs, started, attempt_id):
+            if workflow.schema_version == "2.0":
+                validate_business_data(data)
             if (time.monotonic() - started) * 1000 > node.timeout_ms:
                 raise BusinessError("BUDGET_EXCEEDED", "节点耗时超过预算")
             results = {**state["results"], node.id: data}
@@ -568,7 +824,7 @@ class Runtime:
                 for ref in refs
             ]
             report["missing_evidence"] = [ref for ref in refs if ref not in report["reviewed_evidence_refs"]]
-            from backend.workflow_assistant import builder_model
+            from backend.executors.models import builder_model
 
             response = builder_model(model_config).invoke(
                 [

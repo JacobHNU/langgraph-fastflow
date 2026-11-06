@@ -8,6 +8,16 @@ from backend.schema_validation import validate_data
 from backend.schemas import BusinessError
 
 
+def hide_credential(value, secret):
+    if isinstance(value, str):
+        return value.replace(secret, "[REDACTED]")
+    if isinstance(value, dict):
+        return {hide_credential(key, secret): hide_credential(item, secret) for key, item in value.items()}
+    if isinstance(value, list):
+        return [hide_credential(item, secret) for item in value]
+    return value
+
+
 class InvocationGateway:
     def __init__(self, repo, resources):
         self.repo, self.resources = repo, resources
@@ -15,6 +25,9 @@ class InvocationGateway:
     def call(self, capability_ref, arguments, context, connection_ref=None):
         repo = self.repo
         run_id, node_id = context["run_id"], context["node_id"]
+        from backend.packages import check_deployment_boundary
+
+        check_deployment_boundary(repo, repo.get("run", run_id))
         if repo.get("run", run_id).get("cancel_requested"):
             raise BusinessError("CANCELLED", "已在 HTTP 调用边界确认取消")
         if capability_ref not in context["policy"].get("capability_refs", []):
@@ -29,12 +42,19 @@ class InvocationGateway:
         if len(candidates) != 1:
             raise BusinessError("REFERENCE_INVALID", "操作与连接绑定不唯一或不存在")
         connection, operation = candidates[0]
-        if operation["effect"] != "read_only" or operation["method"] != "GET":
+        if (
+            operation["effect"] != "read_only"
+            or operation["method"] not in ("GET", "POST")
+            or operation["method"] == "POST"
+            and not operation.get("read_only_confirmed")
+        ):
             raise BusinessError("POLICY_DENIED", "当前 HTTP 适配器仅允许已登记只读操作")
         scopes = context["policy"].get("resource_scopes", [])
         if "http:registered" not in scopes and not (capability_ref == "orders.list@1" and "orders:customer" in scopes):
             raise BusinessError("POLICY_DENIED", "HTTP 操作缺少对应资源作用域")
         validate_data(operation["input_schema"], arguments)
+        if set(arguments) - set(operation["input_schema"].get("properties", {})):
+            raise BusinessError("INPUT_INVALID", "HTTP 操作包含未登记参数")
         calls = [e for e in repo.events(run_id) if e["event_type"] == "tool.requested"]
         if (
             sum(e["node_id"] == node_id for e in calls) >= context["policy"].get("max_tool_calls", 6)
@@ -46,7 +66,18 @@ class InvocationGateway:
         if remaining <= 0:
             raise BusinessError("BUDGET_EXCEEDED", "运行活动时间预算耗尽")
         timeout = min(timeout, remaining)
-        path = operation["path"].format(**{key: quote(str(value), safe="") for key, value in arguments.items()})
+        from backend.transforms import select_path
+
+        mappings = operation.get("parameters")
+        if mappings is None:
+            mappings = {key: {"location": "path", "name": key} for key in arguments}
+        parameters = {location: {} for location in ("path", "query", "header", "body")}
+        for key, value in arguments.items():
+            spec = mappings[key]
+            parameters[spec["location"]][spec["name"]] = value
+        path = operation["path"].format(
+            **{key: quote(str(value), safe="") for key, value in parameters["path"].items()}
+        )
         token = self.resources.secret(connection["credential_ref"])
         invocation_id = uid("invocation")
         record = {
@@ -69,10 +100,20 @@ class InvocationGateway:
         )
         started = time.monotonic()
         try:
-            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            headers = {key: str(value) for key, value in parameters["header"].items()}
+            if any("\r" in value or "\n" in value for value in headers.values()):
+                raise BusinessError("INPUT_INVALID", "请求头不能包含换行")
+            auth_type = connection.get("auth_type", "bearer")
+            if token and auth_type == "bearer":
+                headers["Authorization"] = f"Bearer {token}"
+            elif token and auth_type == "api_key":
+                headers[connection.get("auth_header", "X-API-Key")] = token
+            kwargs = {"headers": headers, "params": parameters["query"]}
+            if operation["method"] == "POST":
+                kwargs["json"] = parameters["body"]
             # No environment proxy, redirects, retries or model-selected hosts.
             with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:  # noqa: SIM117
-                with client.stream("GET", connection["base_url"] + path, headers=headers) as response:
+                with client.stream(operation["method"], connection["base_url"] + path, **kwargs) as response:
                     if not 200 <= response.status_code < 300:
                         raise BusinessError("CONNECTOR_HTTP_ERROR", f"HTTP 查询返回状态 {response.status_code}")
                     chunks, size = [], 0
@@ -92,15 +133,13 @@ class InvocationGateway:
                     result = {
                         "ok": True,
                         "status": response.status_code,
-                        "data": data,
+                        "data": select_path(data, operation.get("response_path", [])),
                         "meta": {"invocation_id": invocation_id},
                     }
-            validate_data(operation["response_schema"], result, "OUTPUT_INVALID")
             # Remove the credential even if a remote service echoes it into data.
             if token:
-                from backend.repository import dump
-
-                result = json.loads(dump(result).replace(token, "[REDACTED]"))
+                result = hide_credential(result, token)
+            validate_data(operation["response_schema"], result, "OUTPUT_INVALID")
             ref = repo.evidence(run_id, node_id, result)
             repo.update("invocation", invocation_id, status="SUCCEEDED", finished_at=now(), evidence_ref=ref)
             repo.event(
@@ -133,6 +172,12 @@ class InvocationGateway:
                 run_id,
                 "tool.failed",
                 node_id,
-                {"invocation_id": invocation_id, "code": error.code, "message": error.message},
+                {
+                    "invocation_id": invocation_id,
+                    "code": error.code,
+                    "message": error.message,
+                    "duration_ms": round((time.monotonic() - started) * 1000, 2),
+                    "timeout_seconds": timeout,
+                },
             )
             raise error from None

@@ -20,6 +20,7 @@ class Node(BaseModel):
         "subworkflow",
         "http",
         "human_input",
+        "transform",
     ]
     type_version: Literal["1"] = "1"
     title: str = ""

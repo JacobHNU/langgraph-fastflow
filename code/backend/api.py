@@ -19,6 +19,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from backend.compiler import validate
 from backend.demo_orders import start_demo_orders
 from backend.executors.models import model_mode
+from backend.identity import actor_ref
 from backend.model_settings import ModelSettingsRequest, list_models, test_connection
 from backend.registry import FUNCTIONS, NODE_TYPES, skills
 from backend.repository import Repository, digest, dump, now, uid
@@ -33,11 +34,19 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 logging.basicConfig(level=logging.INFO)
 
 
-def create_app(data_dir=None):
+def create_workspace_app(data_dir=None, *, examples=True, pool=None, workspace_id="ws_legacy", headless=False):
     repo = Repository(data_dir)
-    seed(repo)
-    runtime = Runtime(repo)
-    seed_v2(repo, runtime.resources)
+    repo.seed_examples = examples
+    repo.workspace_id = workspace_id
+    repo.allow_environment = not headless
+    if examples:
+        seed(repo)
+    runtime = Runtime(repo, pool=pool)
+    if examples:
+        seed_v2(repo, runtime.resources)
+        from backend.m11 import seed_integration_lab
+
+        seed_integration_lab(repo, runtime.resources)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -136,7 +145,7 @@ def create_app(data_dir=None):
             "status": "ok",
             "engine": "LangGraph",
             "model_mode": model_mode(runtime.model_settings.current()),
-            "identity": "local-demo-operator",
+            "identity": actor_ref(),
             "storage": "SQLite + SqliteSaver",
             "dependencies": manifest({"nodes": [], "skill_refs": []})["packages"],
         }
@@ -170,6 +179,13 @@ def create_app(data_dir=None):
                     "type": "http",
                     "label": "HTTP 查询",
                     "description": "调用已登记的只读 HTTP 操作",
+                    "type_version": "1",
+                    "schema_versions": ["2.0"],
+                },
+                {
+                    "type": "transform",
+                    "label": "字段转换",
+                    "description": "字段映射、默认值、类型转换与数组提取",
                     "type_version": "1",
                     "schema_versions": ["2.0"],
                 },
@@ -259,6 +275,18 @@ def create_app(data_dir=None):
         errors = all_errors(Workflow.model_validate(agent["workflow"]), agent_id)
         return {"valid": not errors, "errors": errors, "revision": agent["revision"]}
 
+    class NodeDebugRequest(BaseModel):
+        revision: int
+        workflow: Workflow
+        layout: dict = Field(default_factory=dict)
+        node_id: str
+        inputs: dict = Field(default_factory=dict)
+
+    @app.post("/api/agents/{agent_id}/debug", status_code=202)
+    def debug_node(agent_id: str, body: NodeDebugRequest):
+        active_agent(repo, agent_id)
+        return runtime.create_debug_run(agent_id, body.revision, body.workflow, body.layout, body.node_id, body.inputs)
+
     @app.post("/api/agents/{agent_id}/simulate")
     def simulate(agent_id: str):
         with repo.lock:
@@ -321,6 +349,10 @@ def create_app(data_dir=None):
             if v2:
                 value["resolved_bindings"] = runtime.resources.bindings(Workflow.model_validate(agent["workflow"]))
                 value["dependency_manifest"]["resources"] = value["resolved_bindings"]
+                value["dependency_manifest"]["skills"] = [
+                    {"ref": ref, "sha256": s["sha256"]}
+                    for ref, s in value["resolved_bindings"].get("skills", {}).items()
+                ]
             repo.put("release", f"{agent_id}:{version}", value)
             repo.update("agent", agent_id, latest_version=version)
             return value
@@ -410,6 +442,10 @@ def create_app(data_dir=None):
         async def stream():
             nonlocal cursor
             while not await request.is_disconnected():
+                guard = request.scope.get("session_guard")
+                if guard and not guard():
+                    yield "event: session-expired\ndata: {}\n\n"
+                    break
                 for event in repo.events(run_id, cursor):
                     cursor = event["sequence"]
                     yield f"id: {cursor}\ndata: {dump(event)}\n\n"
@@ -439,6 +475,8 @@ def create_app(data_dir=None):
             approval = get("approval", approval_id)
             if approval["run_id"] != run_id:
                 raise BusinessError("POLICY_DENIED", "审批不属于此运行")
+            if approval["status"] == "EXPIRED":
+                raise BusinessError("APPROVAL_STALE", "审批已过期")
             expected = "APPROVED" if body.decision == "approve" else "REJECTED"
             if approval["status"] == expected:
                 return approval
@@ -448,7 +486,12 @@ def create_app(data_dir=None):
             if approval["expires_at"] < time.time() or project["object_version"] != approval["plan"]["object_version"]:
                 raise BusinessError("APPROVAL_STALE", "审批已过期或项目版本发生变化")
             value = repo.update(
-                "approval", approval_id, status=expected, decided_at=now(), actor_ref="local-demo-operator"
+                "approval",
+                approval_id,
+                status=expected,
+                decided_at=now(),
+                actor_ref=actor_ref(),
+                revision=approval.get("revision", 1) + 1,
             )
             repo.event(
                 run_id,
@@ -481,6 +524,7 @@ def create_app(data_dir=None):
 
     @app.post("/api/runs/{run_id}/inputs/{request_id}")
     def submit_input(run_id: str, request_id: str, body: InputDecision):
+        from backend.data_policy import BUSINESS_DATA_POLICY, contains_redacted, validate_business_data
         from backend.schema_validation import validate_data
 
         with repo.transaction():
@@ -501,6 +545,9 @@ def create_app(data_dir=None):
                 raise BusinessError("REVISION_CONFLICT", "人工确认已处理或运行未等待输入")
             if record["expires_at"] < time.time():
                 raise BusinessError("INPUT_EXPIRED", "人工确认已过期")
+            validate_business_data(body.payload)
+            if contains_redacted(body.payload):
+                raise BusinessError("INPUT_INVALID", "反馈包含脱敏占位符，请填写实际业务内容")
             if body.decision == "accept":
                 validate_data(record["form_schema"], body.payload)
             record = repo.update(
@@ -508,8 +555,9 @@ def create_app(data_dir=None):
                 request_id,
                 status="ACCEPTED" if body.decision == "accept" else "REJECTED",
                 payload=body.payload,
+                business_data_policy=BUSINESS_DATA_POLICY,
                 revision=record["revision"] + 1,
-                actor_ref="local-demo-operator",
+                actor_ref=actor_ref(),
                 decided_at=now(),
                 idempotency_key=body.idempotency_key,
                 request_hash=request_hash,
@@ -520,7 +568,13 @@ def create_app(data_dir=None):
                 record["node_id"],
                 {"request_id": request_id, "decision": body.decision, "payload": body.payload},
             )
-            repo.update("run", run_id, status="QUEUED", resume={"request_id": request_id})
+            repo.update(
+                "run",
+                run_id,
+                status="QUEUED",
+                resume={"request_id": request_id},
+                business_data_policy=BUSINESS_DATA_POLICY,
+            )
             return record
 
     @app.post("/api/runs/{run_id}/reconcile")
@@ -565,6 +619,8 @@ def create_app(data_dir=None):
     def retry_evaluation(run_id: str):
         with repo.lock:
             run = get("run", run_id)
+            if run.get("entrypoint") == "node_debug":
+                raise BusinessError("EVALUATION_CONFLICT", "节点试跑只保留调试证据，完整工作流运行后才能评估")
             if run["status"] not in TERMINAL or run["evaluation_status"] in ("PENDING", "RUNNING"):
                 raise BusinessError("EVALUATION_CONFLICT", "运行未结束或评估正在进行")
             return repo.update("run", run_id, evaluation_status="PENDING")
@@ -580,6 +636,32 @@ def create_app(data_dir=None):
         index = next(e for e in repo.evidence_index(value["run_id"]) if e["id"] == evidence_id)
         return {**value, "title": index["title"]}
 
+    from backend.package_api import register_package_api
+
+    register_package_api(app, runtime, studio=not headless)
+    if headless:
+        # Share run, evidence and confirmation handlers; no editor or authoring routes.
+        app.router.routes = [
+            route
+            for route in app.router.routes
+            if getattr(route, "path", "").startswith(
+                ("/api/runs", "/api/evidence", "/api/settings/model", "/api/runtime/")
+            )
+        ]
+        for route in list(app.router.routes):
+            if route.path.startswith(("/api/runs", "/api/evidence")):
+                app.add_api_route(
+                    route.path.replace("/api/", "/api/runtime/", 1), route.endpoint, methods=route.methods
+                )
+        register_resources(app, runtime.resources)
+        from fastapi.responses import FileResponse
+
+        @app.get("/", include_in_schema=False)
+        def console():
+            return FileResponse(Path(__file__).parent / "runtime_console.html")
+
+        return app
+
     register_management(app, repo)
     register_resources(app, runtime.resources)
     from backend.workflow_assistant import register_assistant
@@ -590,3 +672,9 @@ def create_app(data_dir=None):
     if frontend.exists():
         app.mount("/", StaticFiles(directory=frontend, html=True), name="frontend")
     return app
+
+
+def create_app(data_dir=None):
+    from backend.system import create_system_app
+
+    return create_system_app(data_dir, create_workspace_app)
